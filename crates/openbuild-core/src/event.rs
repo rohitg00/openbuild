@@ -1,5 +1,5 @@
-use crate::request::{StopReason, Usage};
 use crate::provider::ProviderError;
+use crate::request::{StopReason, Usage};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

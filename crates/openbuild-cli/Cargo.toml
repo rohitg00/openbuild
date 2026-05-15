@@ -18,6 +18,7 @@ openbuild-providers.workspace = true
 openbuild-tools.workspace = true
 openbuild-config.workspace = true
 openbuild-session.workspace = true
+async-trait.workspace = true
 tokio.workspace = true
 clap.workspace = true
 anyhow.workspace = true

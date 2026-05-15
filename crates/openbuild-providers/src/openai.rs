@@ -19,7 +19,11 @@ pub struct OpenAi {
 }
 
 impl OpenAi {
-    pub fn new(id: impl Into<String>, base_url: impl Into<String>, api_key: impl Into<String>) -> Self {
+    pub fn new(
+        id: impl Into<String>,
+        base_url: impl Into<String>,
+        api_key: impl Into<String>,
+    ) -> Self {
         Self {
             id: id.into(),
             base_url: base_url.into(),
@@ -52,7 +56,26 @@ struct StreamOptions {
 #[derive(Serialize)]
 struct WireMessage {
     role: String,
-    content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    tool_calls: Vec<WireToolCall>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_call_id: Option<String>,
+}
+
+#[derive(Serialize)]
+struct WireToolCall {
+    id: String,
+    #[serde(rename = "type")]
+    kind: &'static str,
+    function: WireToolCallFn,
+}
+
+#[derive(Serialize)]
+struct WireToolCallFn {
+    name: String,
+    arguments: String,
 }
 
 #[derive(Serialize)]
@@ -90,6 +113,26 @@ struct Delta {
     content: Option<String>,
     #[serde(default)]
     reasoning: Option<String>,
+    #[serde(default)]
+    tool_calls: Vec<DeltaToolCall>,
+}
+
+#[derive(Deserialize, Default)]
+struct DeltaToolCall {
+    #[serde(default)]
+    index: u32,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    function: Option<DeltaToolCallFn>,
+}
+
+#[derive(Deserialize, Default)]
+struct DeltaToolCallFn {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    arguments: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -102,7 +145,7 @@ struct UsageWire {
     reasoning_tokens: u32,
 }
 
-fn flatten(msg: &Message) -> WireMessage {
+fn flatten(msg: &Message) -> Vec<WireMessage> {
     let role = match msg.role {
         Role::System => "system",
         Role::User => "user",
@@ -110,12 +153,43 @@ fn flatten(msg: &Message) -> WireMessage {
         Role::Tool => "tool",
     };
     let mut text = String::new();
+    let mut tool_calls = Vec::new();
+    let mut tool_results: Vec<WireMessage> = Vec::new();
     for b in &msg.content {
-        if let Block::Text { text: t } = b {
-            text.push_str(t);
+        match b {
+            Block::Text { text: t } => text.push_str(t),
+            Block::ToolUse { id, name, input } => tool_calls.push(WireToolCall {
+                id: id.clone(),
+                kind: "function",
+                function: WireToolCallFn {
+                    name: name.clone(),
+                    arguments: serde_json::to_string(input).unwrap_or_default(),
+                },
+            }),
+            Block::ToolResult {
+                tool_use_id,
+                content,
+                ..
+            } => tool_results.push(WireMessage {
+                role: "tool".into(),
+                content: Some(content.clone()),
+                tool_calls: Vec::new(),
+                tool_call_id: Some(tool_use_id.clone()),
+            }),
+            _ => {}
         }
     }
-    WireMessage { role: role.into(), content: text }
+    let mut out = Vec::new();
+    if !text.is_empty() || !tool_calls.is_empty() {
+        out.push(WireMessage {
+            role: role.into(),
+            content: (!text.is_empty()).then_some(text),
+            tool_calls,
+            tool_call_id: None,
+        });
+    }
+    out.extend(tool_results);
+    out
 }
 
 #[async_trait]
@@ -140,10 +214,15 @@ impl Provider for OpenAi {
                     sys.push_str(text);
                 }
             }
-            messages.push(WireMessage { role: "system".into(), content: sys });
+            messages.push(WireMessage {
+                role: "system".into(),
+                content: Some(sys),
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+            });
         }
         for m in &req.messages {
-            messages.push(flatten(m));
+            messages.extend(flatten(m));
         }
 
         let tools: Vec<WireTool> = req
@@ -172,7 +251,9 @@ impl Provider for OpenAi {
                 openbuild_core::request::Effort::Xhigh => "high",
                 openbuild_core::request::Effort::Max => "high",
             }),
-            stream_options: req.stream.then(|| StreamOptions { include_usage: true }),
+            stream_options: req.stream.then_some(StreamOptions {
+                include_usage: true,
+            }),
         };
 
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
@@ -194,12 +275,16 @@ impl Provider for OpenAi {
         let bytes = resp.bytes_stream();
         let stream = ::async_stream::try_stream! {
             let mut decoder = SseDecoder::new();
+            let mut active_tool_calls: std::collections::HashMap<u32, String> = std::collections::HashMap::new();
             futures::pin_mut!(bytes);
             while let Some(chunk) = bytes.next().await {
                 let chunk = chunk.map_err(|e| ProviderError::Http(e.to_string()))?;
                 let text = String::from_utf8_lossy(&chunk).into_owned();
                 for frame in decoder.push(&text) {
                     if frame == "[DONE]" {
+                        for id in active_tool_calls.values() {
+                            yield Event::ToolCallEnd { id: id.clone() };
+                        }
                         yield Event::Done(StopReason::EndTurn);
                         return;
                     }
@@ -220,7 +305,29 @@ impl Provider for OpenAi {
                         if let Some(t) = choice.delta.content {
                             yield Event::TextDelta { text: t };
                         }
+                        for tc in choice.delta.tool_calls {
+                            let id = match tc.id {
+                                Some(new_id) => {
+                                    let name = tc.function.as_ref().and_then(|f| f.name.clone()).unwrap_or_default();
+                                    active_tool_calls.insert(tc.index, new_id.clone());
+                                    yield Event::ToolCallStart { id: new_id.clone(), name };
+                                    new_id
+                                }
+                                None => active_tool_calls.get(&tc.index).cloned().unwrap_or_default(),
+                            };
+                            if let Some(f) = tc.function {
+                                if let Some(args) = f.arguments {
+                                    if !args.is_empty() {
+                                        yield Event::ToolCallDelta { id, args_delta: args };
+                                    }
+                                }
+                            }
+                        }
                         if let Some(fr) = choice.finish_reason {
+                            for id in active_tool_calls.values() {
+                                yield Event::ToolCallEnd { id: id.clone() };
+                            }
+                            active_tool_calls.clear();
                             let reason = match fr.as_str() {
                                 "stop" => StopReason::EndTurn,
                                 "length" => StopReason::MaxTokens,
@@ -236,4 +343,3 @@ impl Provider for OpenAi {
         Ok(Box::pin(stream))
     }
 }
-

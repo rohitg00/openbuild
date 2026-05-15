@@ -12,11 +12,25 @@ pub enum Role {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Block {
-    Text { text: String },
-    Thinking { text: String },
-    Image { source: ImageSource },
-    ToolUse { id: String, name: String, input: serde_json::Value },
-    ToolResult { tool_use_id: String, content: String, is_error: bool },
+    Text {
+        text: String,
+    },
+    Thinking {
+        text: String,
+    },
+    Image {
+        source: ImageSource,
+    },
+    ToolUse {
+        id: String,
+        name: String,
+        input: serde_json::Value,
+    },
+    ToolResult {
+        tool_use_id: String,
+        content: String,
+        is_error: bool,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -34,10 +48,16 @@ pub struct Message {
 
 impl Message {
     pub fn user_text(text: impl Into<String>) -> Self {
-        Self { role: Role::User, content: vec![Block::Text { text: text.into() }] }
+        Self {
+            role: Role::User,
+            content: vec![Block::Text { text: text.into() }],
+        }
     }
 
     pub fn assistant_text(text: impl Into<String>) -> Self {
-        Self { role: Role::Assistant, content: vec![Block::Text { text: text.into() }] }
+        Self {
+            role: Role::Assistant,
+            content: vec![Block::Text { text: text.into() }],
+        }
     }
 }

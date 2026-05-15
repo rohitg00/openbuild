@@ -19,7 +19,8 @@ impl Tool for ReadFile {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             name: "read_file".into(),
-            description: "Read a file from the workspace. Optional offset (lines) and limit (lines).".into(),
+            description:
+                "Read a file from the workspace. Optional offset (lines) and limit (lines).".into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
