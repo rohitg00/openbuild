@@ -128,6 +128,12 @@ struct Cli {
     #[arg(long)]
     agent: Option<String>,
 
+    #[arg(long)]
+    agent_profile: Option<PathBuf>,
+
+    #[arg(long, default_value_t = false)]
+    restore_code: bool,
+
     #[command(subcommand)]
     cmd: Option<Cmd>,
 }
@@ -148,6 +154,26 @@ enum Cmd {
         #[command(subcommand)]
         action: SkillsCmd,
     },
+    Agents {
+        #[command(subcommand)]
+        action: AgentsCmd,
+    },
+    Memory {
+        #[command(subcommand)]
+        action: MemoryCmd,
+    },
+    Import {
+        #[command(subcommand)]
+        action: ImportCmd,
+    },
+    Trace {
+        #[command(subcommand)]
+        action: TraceCmd,
+    },
+    Agent {
+        #[command(subcommand)]
+        action: AgentRunCmd,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -166,6 +192,37 @@ enum McpCmd {
 enum SkillsCmd {
     List,
     Show { name: String },
+}
+
+#[derive(Subcommand, Debug)]
+enum AgentsCmd {
+    List,
+    Show { name: String },
+}
+
+#[derive(Subcommand, Debug)]
+enum MemoryCmd {
+    List,
+    Get { key: String },
+    Set { key: String, value: String },
+    Remove { key: String },
+    Clear,
+}
+
+#[derive(Subcommand, Debug)]
+enum ImportCmd {
+    Claude { path: std::path::PathBuf },
+}
+
+#[derive(Subcommand, Debug)]
+enum TraceCmd {
+    Export { id: String },
+}
+
+#[derive(Subcommand, Debug)]
+enum AgentRunCmd {
+    Stdio,
+    Headless,
 }
 
 struct Stdout {
@@ -288,6 +345,46 @@ impl ToolRunner for GatedTools {
                 content: e,
                 is_error: true,
             },
+        }
+    }
+}
+
+struct McpToolAdapter {
+    client: Arc<openbuild_mcp::StdioClient>,
+    name: String,
+    description: String,
+    input_schema: serde_json::Value,
+    qualified: String,
+}
+
+#[async_trait]
+impl Tool for McpToolAdapter {
+    fn schema(&self) -> ToolSchema {
+        ToolSchema {
+            name: self.qualified.clone(),
+            description: self.description.clone(),
+            input_schema: self.input_schema.clone(),
+        }
+    }
+    async fn run(&self, input: serde_json::Value) -> Result<String, String> {
+        self.client
+            .call_tool(&self.name, input)
+            .await
+            .map_err(|e| e.to_string())
+    }
+}
+
+struct DefaultChildFactory;
+
+impl openbuild_tools::task::ChildToolFactory for DefaultChildFactory {
+    fn build(&self, capability: &str) -> Vec<Box<dyn Tool>> {
+        let base = openbuild_tools::default_tools();
+        if capability == "read-only" {
+            base.into_iter()
+                .filter(|t| !t.is_write() && t.schema().name != "run_terminal_cmd")
+                .collect()
+        } else {
+            base
         }
     }
 }
@@ -421,23 +518,66 @@ async fn main() -> Result<()> {
         openbuild_sandbox::discover_profile(name, &cwd)
     });
 
-    let tools: Vec<Box<dyn Tool>> = if cli.no_tools {
+    let mut tools: Vec<Box<dyn Tool>> = if cli.no_tools {
         Vec::new()
     } else {
-        openbuild_tools::default_tools_with_sandbox(sandbox_profile)
-            .into_iter()
-            .filter(|t| {
-                let n = t.schema().name;
-                if denied.contains(&n) {
-                    return false;
-                }
-                if let Some(a) = &allowed {
-                    return a.contains(&n);
-                }
-                true
-            })
-            .collect()
+        openbuild_tools::default_tools_with(openbuild_tools::BuildOpts {
+            sandbox_profile,
+            web_disabled: cli.disable_web_search,
+        })
+        .into_iter()
+        .filter(|t| {
+            let n = t.schema().name;
+            if denied.contains(&n) {
+                return false;
+            }
+            if let Some(a) = &allowed {
+                return a.contains(&n);
+            }
+            true
+        })
+        .collect()
     };
+
+    if !cli.no_subagents && !cli.no_tools {
+        tools.push(Box::new(openbuild_tools::task::TaskSpawn {
+            provider: provider.clone(),
+            max_turns: cli.max_turns,
+            depth: 0,
+            max_depth: 3,
+            child_tools: Arc::new(DefaultChildFactory),
+        }) as Box<dyn Tool>);
+    }
+
+    let cwd_now = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let cfg = openbuild_config::import::discover_all(&cwd_now);
+    let mut mcp_clients: Vec<(String, Arc<openbuild_mcp::StdioClient>)> = Vec::new();
+    for (name, server) in &cfg.mcp_servers {
+        if let openbuild_config::McpServer::Stdio { command, args, env } = server {
+            match openbuild_mcp::StdioClient::spawn(command, args, env).await {
+                Ok(client) => {
+                    if let Ok(remote_tools) = client.list_tools().await {
+                        for rt in remote_tools {
+                            tools.push(Box::new(McpToolAdapter {
+                                client: client.clone(),
+                                name: rt.name.clone(),
+                                description: rt.description.clone(),
+                                input_schema: rt.input_schema.clone(),
+                                qualified: format!("mcp__{}__{}", name, rt.name),
+                            }) as Box<dyn Tool>);
+                        }
+                    }
+                    mcp_clients.push((name.clone(), client));
+                }
+                Err(e) => {
+                    eprintln!("[mcp] {name}: spawn failed: {e}");
+                }
+            }
+        }
+    }
+    if !mcp_clients.is_empty() {
+        eprintln!("[mcp] {} server(s) connected", mcp_clients.len());
+    }
 
     let mut engine = Engine::default();
     if cli.always_approve {
@@ -459,11 +599,16 @@ async fn main() -> Result<()> {
         engine.add_deny(r)?;
     }
 
+    let tool_names = runner_tools_snapshot(&tools);
     let runner = Arc::new(GatedTools {
         tools,
         engine,
         secret_filter: openbuild_redact::Filter::new(),
     });
+
+    if cli.restore_code && (cli.resume.is_some() || cli.continue_recent) {
+        eprintln!("[restore-code] noted; git checkout to source commit pending v0.2");
+    }
 
     let agent = AgentLoop {
         provider,
@@ -484,6 +629,20 @@ async fn main() -> Result<()> {
         });
 
     let mut system_blocks: Vec<Block> = Vec::new();
+
+    if let Some(profile) = &cli.agent_profile {
+        let agent_def = openbuild_agents::load(profile, openbuild_agents::Source::User)
+            .with_context(|| format!("--agent-profile {}", profile.display()))?;
+        let rendered = openbuild_agents::render_prompt(&agent_def.system_prompt, &tool_names);
+        system_blocks.push(Block::Text { text: rendered });
+    } else if let Some(name) = &cli.agent {
+        let bundled = bundled_dir();
+        let agent_def = openbuild_agents::load_by_name(name, bundled.as_deref())
+            .with_context(|| format!("--agent {name}"))?;
+        let rendered = openbuild_agents::render_prompt(&agent_def.system_prompt, &tool_names);
+        system_blocks.push(Block::Text { text: rendered });
+    }
+
     if let Some(s) = &cli.system_prompt_override {
         system_blocks.push(Block::Text { text: s.clone() });
     }
@@ -494,6 +653,19 @@ async fn main() -> Result<()> {
             rules.clone()
         };
         system_blocks.push(Block::Text { text });
+    }
+
+    if cli.experimental_memory && !cli.no_memory {
+        let mem = openbuild_memory::render_for_system_prompt().unwrap_or_default();
+        if !mem.is_empty() {
+            system_blocks.push(Block::Text { text: mem });
+        }
+    }
+
+    for instr in cfg.instructions.iter().take(3) {
+        if let Ok(text) = std::fs::read_to_string(&instr.path) {
+            system_blocks.push(Block::Text { text });
+        }
     }
 
     let prompt = if cli.check && !cli.verbatim {
@@ -631,7 +803,187 @@ async fn run_subcommand(cmd: &Cmd) -> Result<()> {
         Cmd::Sessions { action } => cmd_sessions(action),
         Cmd::Mcp { action } => cmd_mcp(action).await,
         Cmd::Skills { action } => cmd_skills(action),
+        Cmd::Agents { action } => cmd_agents(action),
+        Cmd::Memory { action } => cmd_memory(action),
+        Cmd::Import { action } => cmd_import(action),
+        Cmd::Trace { action } => cmd_trace(action),
+        Cmd::Agent { action } => cmd_agent_ipc(action).await,
     }
+}
+
+fn cmd_agents(action: &AgentsCmd) -> Result<()> {
+    let bundled = bundled_dir();
+    match action {
+        AgentsCmd::List => {
+            for a in openbuild_agents::discover_all(bundled.as_deref()) {
+                println!(
+                    "{}\t{:?}\t{}",
+                    a.frontmatter.name, a.source, a.frontmatter.description
+                );
+            }
+        }
+        AgentsCmd::Show { name } => {
+            let a = openbuild_agents::load_by_name(name, bundled.as_deref())?;
+            println!("{}", a.system_prompt);
+        }
+    }
+    Ok(())
+}
+
+fn cmd_memory(action: &MemoryCmd) -> Result<()> {
+    match action {
+        MemoryCmd::List => {
+            let store = openbuild_memory::load()?;
+            for (k, e) in &store.entries {
+                println!("{k}\t{}\t{}", e.updated_at, e.value);
+            }
+        }
+        MemoryCmd::Get { key } => {
+            if let Some(v) = openbuild_memory::get(key)? {
+                println!("{v}");
+            }
+        }
+        MemoryCmd::Set { key, value } => openbuild_memory::set(key, value)?,
+        MemoryCmd::Remove { key } => {
+            let existed = openbuild_memory::remove(key)?;
+            println!("removed: {existed}");
+        }
+        MemoryCmd::Clear => {
+            openbuild_memory::save(&openbuild_memory::Store::default())?;
+            println!("cleared");
+        }
+    }
+    Ok(())
+}
+
+fn cmd_import(action: &ImportCmd) -> Result<()> {
+    match action {
+        ImportCmd::Claude { path } => {
+            let text = std::fs::read_to_string(path)
+                .with_context(|| format!("read {}", path.display()))?;
+            let dest_dir = openbuild_session::sessions_dir()?;
+            std::fs::create_dir_all(&dest_dir)?;
+            let new_id = uuid::Uuid::new_v4();
+            let dest = dest_dir.join(format!("{new_id}.jsonl"));
+            let mut out = String::new();
+            out.push_str(
+                &serde_json::json!({
+                    "type": "session_start",
+                    "id": new_id.to_string(),
+                    "imported_from": path.display().to_string(),
+                    "agent": "claude",
+                })
+                .to_string(),
+            );
+            out.push('\n');
+            for line in text.lines() {
+                let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+                    continue;
+                };
+                if let Some(t) = v.get("type").and_then(|t| t.as_str()) {
+                    let mapped = match t {
+                        "user" => "user_message",
+                        "assistant" => "assistant_message",
+                        "summary" => "summary",
+                        _ => continue,
+                    };
+                    let entry = serde_json::json!({
+                        "type": mapped,
+                        "original_type": t,
+                        "payload": v,
+                    });
+                    out.push_str(&entry.to_string());
+                    out.push('\n');
+                }
+            }
+            std::fs::write(&dest, out)?;
+            println!("imported -> {}", dest.display());
+        }
+    }
+    Ok(())
+}
+
+fn cmd_trace(action: &TraceCmd) -> Result<()> {
+    match action {
+        TraceCmd::Export { id } => {
+            let path = openbuild_session::find_by_id(id)?
+                .ok_or_else(|| anyhow::anyhow!("session not found: {id}"))?;
+            let text = std::fs::read_to_string(&path)?;
+            let mut spans = Vec::new();
+            for line in text.lines() {
+                let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+                    continue;
+                };
+                if let Some(t) = v.get("type").and_then(|t| t.as_str()) {
+                    spans.push(serde_json::json!({
+                        "name": t,
+                        "attributes": v,
+                    }));
+                }
+            }
+            let out = serde_json::json!({
+                "session_id": id,
+                "source": path.display().to_string(),
+                "spans": spans,
+            });
+            println!("{}", serde_json::to_string_pretty(&out)?);
+        }
+    }
+    Ok(())
+}
+
+async fn cmd_agent_ipc(action: &AgentRunCmd) -> Result<()> {
+    match action {
+        AgentRunCmd::Stdio | AgentRunCmd::Headless => {
+            use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+            let mut stdin = BufReader::new(tokio::io::stdin()).lines();
+            let mut stdout = tokio::io::stdout();
+            while let Ok(Some(line)) = stdin.next_line().await {
+                let req: serde_json::Value = match serde_json::from_str(&line) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        let err = serde_json::json!({"type":"error","error":e.to_string()});
+                        stdout.write_all(err.to_string().as_bytes()).await?;
+                        stdout.write_all(b"\n").await?;
+                        continue;
+                    }
+                };
+                let prompt = req
+                    .get("prompt")
+                    .and_then(|p| p.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let ack = serde_json::json!({
+                    "type": "ack",
+                    "received_prompt_len": prompt.len(),
+                });
+                stdout.write_all(ack.to_string().as_bytes()).await?;
+                stdout.write_all(b"\n").await?;
+            }
+            Ok(())
+        }
+    }
+}
+
+fn runner_tools_snapshot(tools: &[Box<dyn Tool>]) -> Vec<String> {
+    tools.iter().map(|t| t.schema().name).collect()
+}
+
+fn bundled_dir() -> Option<std::path::PathBuf> {
+    let candidates = [
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+            .map(|p| p.join("..").join("bundled").join("agents")),
+        Some(
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join("..")
+                .join("bundled")
+                .join("agents"),
+        ),
+    ];
+    candidates.into_iter().flatten().find(|c| c.exists())
 }
 
 fn cmd_inspect() -> Result<()> {

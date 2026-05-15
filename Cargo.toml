@@ -12,6 +12,8 @@ members = [
     "crates/openbuild-mcp",
     "crates/openbuild-sandbox",
     "crates/openbuild-tui",
+    "crates/openbuild-agents",
+    "crates/openbuild-memory",
 ]
 
 [workspace.package]
@@ -53,6 +55,8 @@ openbuild-skills = { path = "crates/openbuild-skills", version = "0.0.1" }
 openbuild-mcp = { path = "crates/openbuild-mcp", version = "0.0.1" }
 openbuild-sandbox = { path = "crates/openbuild-sandbox", version = "0.0.1" }
 openbuild-tui = { path = "crates/openbuild-tui", version = "0.0.1" }
+openbuild-agents = { path = "crates/openbuild-agents", version = "0.0.1" }
+openbuild-memory = { path = "crates/openbuild-memory", version = "0.0.1" }
 
 [profile.release]
 lto = "thin"

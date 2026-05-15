@@ -21,3 +21,5 @@ tracing.workspace = true
 regex.workspace = true
 globset = "0.4"
 ignore = "0.4"
+reqwest = { workspace = true }
+urlencoding = "2"

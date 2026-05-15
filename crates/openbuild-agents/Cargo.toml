@@ -1,0 +1,16 @@
+[package]
+name = "openbuild-agents"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "Agent registry — bundled + user + project agents with frontmatter"
+
+[dependencies]
+openbuild-core.workspace = true
+serde.workspace = true
+serde_yaml = "0.9"
+anyhow.workspace = true
+dirs.workspace = true
