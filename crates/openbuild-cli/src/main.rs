@@ -28,20 +28,16 @@ struct Cli {
     #[arg(long, default_value_t = false)]
     verbatim: bool,
 
-    #[arg(short = 'm', long, default_value = "gpt-4o-mini")]
-    model: String,
+    #[arg(short = 'm', long)]
+    model: Option<String>,
 
-    #[arg(long, env = "OPENBUILD_PROVIDER", default_value = "openai")]
-    provider: String,
+    #[arg(long)]
+    provider: Option<String>,
 
-    #[arg(
-        long,
-        env = "OPENBUILD_BASE_URL",
-        default_value = "https://api.openai.com/v1"
-    )]
-    base_url: String,
+    #[arg(long)]
+    base_url: Option<String>,
 
-    #[arg(long, env = "OPENBUILD_API_KEY")]
+    #[arg(long)]
     api_key: Option<String>,
 
     #[arg(long, default_value = "plain", value_parser = ["plain", "json", "streaming-json"])]
@@ -229,15 +225,11 @@ enum Cmd {
 #[derive(Subcommand, Debug)]
 enum ModelsCmd {
     Live {
-        #[arg(long, env = "OPENBUILD_PROVIDER", default_value = "openai")]
-        provider: String,
-        #[arg(
-            long,
-            env = "OPENBUILD_BASE_URL",
-            default_value = "https://api.openai.com/v1"
-        )]
-        base_url: String,
-        #[arg(long, env = "OPENBUILD_API_KEY")]
+        #[arg(long)]
+        provider: Option<String>,
+        #[arg(long)]
+        base_url: Option<String>,
+        #[arg(long)]
         api_key: Option<String>,
     },
 }
@@ -757,7 +749,6 @@ async fn main() -> Result<()> {
     }
 
     let prompt = resolve_prompt(&cli)?;
-    let api_key = cli.api_key.clone().unwrap_or_default();
 
     let bundled_for_agent = bundled_dir();
     let agent_def = if let Some(path) = &cli.agent_profile {
@@ -774,17 +765,23 @@ async fn main() -> Result<()> {
         None
     };
 
-    let mut effective_model = cli.model.clone();
+    let (provider_name, mut effective_model, default_base, picked_key) = resolve_provider(
+        cli.provider.as_deref(),
+        cli.model.as_deref(),
+        cli.base_url.as_deref(),
+        cli.api_key.as_deref(),
+    );
     if let Some(def) = &agent_def {
-        if cli.model == "gpt-4o-mini" {
+        if cli.model.is_none() {
             if let Some(m) = &def.frontmatter.model {
                 effective_model = m.clone();
             }
         }
     }
-
-    let base_override = (cli.base_url != "https://api.openai.com/v1").then(|| cli.base_url.clone());
-    let provider: Arc<dyn Provider> = match cli.provider.as_str() {
+    let api_key = picked_key;
+    let base_url = cli.base_url.clone().unwrap_or_else(|| default_base.clone());
+    let base_override = (base_url != default_base).then(|| base_url.clone());
+    let provider: Arc<dyn Provider> = match provider_name.as_str() {
         "anthropic" => Arc::new(Anthropic::new(
             effective_model.clone(),
             base_override.unwrap_or_else(|| "https://api.anthropic.com/v1".into()),
@@ -792,12 +789,28 @@ async fn main() -> Result<()> {
         )),
         "ollama" => Arc::new(Ollama::new(effective_model.clone(), base_override)),
         "xai" => Arc::new(XAi::new(effective_model.clone(), base_override, api_key)),
+        "openrouter" => Arc::new(OpenAi::new(
+            effective_model.clone(),
+            base_url.clone(),
+            api_key,
+        )),
+        "groq" => Arc::new(OpenAi::new(
+            effective_model.clone(),
+            base_url.clone(),
+            api_key,
+        )),
+        "together" => Arc::new(OpenAi::new(
+            effective_model.clone(),
+            base_url.clone(),
+            api_key,
+        )),
         _ => Arc::new(OpenAi::new(
             effective_model.clone(),
-            cli.base_url.clone(),
+            base_url.clone(),
             api_key,
         )),
     };
+    eprintln!("[openbuild] provider={provider_name} model={effective_model}");
 
     let allowed: Option<std::collections::HashSet<String>> = cli
         .tools
@@ -1235,7 +1248,15 @@ async fn run_subcommand(cmd: &Cmd) -> Result<()> {
                 provider,
                 base_url,
                 api_key,
-            }) => cmd_models_live(provider, base_url, api_key.as_deref().unwrap_or("")).await,
+            }) => {
+                let (p, _m, b, k) = resolve_provider(
+                    provider.as_deref(),
+                    None,
+                    base_url.as_deref(),
+                    api_key.as_deref(),
+                );
+                cmd_models_live(&p, &b, &k).await
+            }
         },
         Cmd::Sessions { action } => cmd_sessions(action),
         Cmd::Mcp { action } => cmd_mcp(action).await,
@@ -1334,22 +1355,11 @@ fn cmd_completions(shell: &str) -> Result<()> {
 }
 
 async fn cmd_tui() -> Result<()> {
-    let api_key = std::env::var("OPENBUILD_API_KEY").ok().unwrap_or_default();
-    let base_url =
-        std::env::var("OPENBUILD_BASE_URL").unwrap_or_else(|_| "https://api.openai.com/v1".into());
-    let provider_name = std::env::var("OPENBUILD_PROVIDER").unwrap_or_else(|_| "openai".into());
-    let model = std::env::var("OPENBUILD_MODEL").unwrap_or_else(|_| "gpt-4o-mini".into());
+    let (provider_name, model, base_url, api_key) = resolve_provider(None, None, None, None);
+    eprintln!("[openbuild] provider={provider_name} model={model}");
 
     let provider: Arc<dyn Provider> = match provider_name.as_str() {
-        "anthropic" => Arc::new(Anthropic::new(
-            model.clone(),
-            if base_url == "https://api.openai.com/v1" {
-                "https://api.anthropic.com/v1".into()
-            } else {
-                base_url.clone()
-            },
-            api_key,
-        )),
+        "anthropic" => Arc::new(Anthropic::new(model.clone(), base_url, api_key)),
         "ollama" => Arc::new(Ollama::new(model.clone(), Some(base_url))),
         "xai" => Arc::new(XAi::new(model.clone(), Some(base_url), api_key)),
         _ => Arc::new(OpenAi::new(model.clone(), base_url, api_key)),
@@ -2051,6 +2061,95 @@ fn git_checkout(cwd: &std::path::Path, sha: &str) -> Result<()> {
 
 fn runner_tools_snapshot(tools: &[Box<dyn Tool>]) -> Vec<String> {
     tools.iter().map(|t| t.schema().name).collect()
+}
+
+fn resolve_provider(
+    cli_provider: Option<&str>,
+    cli_model: Option<&str>,
+    cli_base_url: Option<&str>,
+    cli_api_key: Option<&str>,
+) -> (String, String, String, String) {
+    let env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+
+    let provider = cli_provider
+        .map(str::to_string)
+        .or_else(|| env("OPENBUILD_PROVIDER"))
+        .or_else(|| {
+            if env("ANTHROPIC_API_KEY").is_some() {
+                Some("anthropic".into())
+            } else if env("XAI_API_KEY").is_some() || env("GROK_API_KEY").is_some() {
+                Some("xai".into())
+            } else if env("OLLAMA_HOST").is_some() {
+                Some("ollama".into())
+            } else if env("OPENROUTER_API_KEY").is_some() {
+                Some("openrouter".into())
+            } else if env("GROQ_API_KEY").is_some() {
+                Some("groq".into())
+            } else if env("TOGETHER_API_KEY").is_some() {
+                Some("together".into())
+            } else {
+                Some("openai".into())
+            }
+        })
+        .unwrap();
+
+    let (default_model, default_base, key_var) = match provider.as_str() {
+        "anthropic" => (
+            "claude-sonnet-4-5",
+            "https://api.anthropic.com/v1",
+            "ANTHROPIC_API_KEY",
+        ),
+        "xai" => ("grok-4", "https://api.x.ai/v1", "XAI_API_KEY"),
+        "ollama" => ("llama3.2", "http://localhost:11434/v1", ""),
+        "openrouter" => (
+            "openrouter/auto",
+            "https://openrouter.ai/api/v1",
+            "OPENROUTER_API_KEY",
+        ),
+        "groq" => (
+            "llama-3.3-70b-versatile",
+            "https://api.groq.com/openai/v1",
+            "GROQ_API_KEY",
+        ),
+        "together" => (
+            "meta-llama/Llama-3.3-70B-Instruct-Turbo",
+            "https://api.together.xyz/v1",
+            "TOGETHER_API_KEY",
+        ),
+        _ => ("gpt-4o-mini", "https://api.openai.com/v1", "OPENAI_API_KEY"),
+    };
+
+    let model = cli_model
+        .map(str::to_string)
+        .or_else(|| env("OPENBUILD_MODEL"))
+        .unwrap_or_else(|| default_model.to_string());
+
+    let base_url = cli_base_url
+        .map(str::to_string)
+        .or_else(|| env("OPENBUILD_BASE_URL"))
+        .or_else(|| env(&format!("{}_BASE_URL", provider.to_uppercase())))
+        .unwrap_or_else(|| default_base.to_string());
+
+    let api_key = cli_api_key
+        .map(str::to_string)
+        .or_else(|| env("OPENBUILD_API_KEY"))
+        .or_else(|| {
+            if key_var.is_empty() {
+                Some(String::new())
+            } else {
+                env(key_var)
+            }
+        })
+        .or_else(|| {
+            if provider == "xai" {
+                env("GROK_API_KEY")
+            } else {
+                None
+            }
+        })
+        .unwrap_or_default();
+
+    (provider, model, base_url.clone(), api_key)
 }
 
 fn rebuild_messages_from_session(
