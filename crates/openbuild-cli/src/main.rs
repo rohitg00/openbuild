@@ -174,6 +174,22 @@ enum Cmd {
         #[command(subcommand)]
         action: AgentRunCmd,
     },
+    Hooks {
+        #[command(subcommand)]
+        action: HooksCmd,
+    },
+    Setup,
+    Update,
+}
+
+#[derive(Subcommand, Debug)]
+enum HooksCmd {
+    List,
+    Test {
+        event: String,
+        #[arg(default_value = "")]
+        matcher: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -186,6 +202,23 @@ enum SessionsCmd {
 enum McpCmd {
     List,
     Doctor,
+    Add {
+        name: String,
+        command: String,
+        #[arg(num_args = 0..)]
+        args: Vec<String>,
+    },
+    AddHttp {
+        name: String,
+        url: String,
+    },
+    AddSse {
+        name: String,
+        url: String,
+    },
+    Remove {
+        name: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -212,6 +245,9 @@ enum MemoryCmd {
 #[derive(Subcommand, Debug)]
 enum ImportCmd {
     Claude { path: std::path::PathBuf },
+    Cursor { path: std::path::PathBuf },
+    Codex { path: std::path::PathBuf },
+    OpenCode { path: std::path::PathBuf },
 }
 
 #[derive(Subcommand, Debug)]
@@ -223,6 +259,12 @@ enum TraceCmd {
 enum AgentRunCmd {
     Stdio,
     Headless,
+    Serve {
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        #[arg(long, default_value_t = 7424)]
+        port: u16,
+    },
 }
 
 struct Stdout {
@@ -289,6 +331,7 @@ struct GatedTools {
     tools: Vec<Box<dyn Tool>>,
     engine: Engine,
     secret_filter: openbuild_redact::Filter,
+    hooks: Arc<openbuild_hooks::Registry>,
 }
 
 #[async_trait]
@@ -306,6 +349,27 @@ impl ToolRunner for GatedTools {
                 is_error: true,
             };
         };
+        let pre_payload = serde_json::json!({
+            "tool_name": call.name,
+            "tool_input": call.input,
+            "tool_use_id": call.id,
+        });
+        for outcome in self
+            .hooks
+            .fire(openbuild_hooks::Event::PreToolUse, &call.name, &pre_payload)
+            .await
+        {
+            if outcome.blocked {
+                return ToolResult {
+                    call_id: call.id,
+                    content: format!(
+                        "blocked by PreToolUse hook (exit {}): {}",
+                        outcome.exit_code, outcome.stderr
+                    ),
+                    is_error: true,
+                };
+            }
+        }
         let decision = self
             .engine
             .evaluate(&call.name, &call.input, tool.is_write());
@@ -334,17 +398,29 @@ impl ToolRunner for GatedTools {
             }
             Decision::Allow => {}
         }
-        match tool.run(call.input.clone()).await {
-            Ok(content) => ToolResult {
-                call_id: call.id,
-                content: self.secret_filter.redact(&content),
-                is_error: false,
-            },
-            Err(e) => ToolResult {
-                call_id: call.id,
-                content: e,
-                is_error: true,
-            },
+        let outcome = tool.run(call.input.clone()).await;
+        let (content, is_error) = match outcome {
+            Ok(c) => (self.secret_filter.redact(&c), false),
+            Err(e) => (e, true),
+        };
+        let post_payload = serde_json::json!({
+            "tool_name": call.name,
+            "tool_input": call.input,
+            "tool_use_id": call.id,
+            "tool_response": content,
+            "is_error": is_error,
+        });
+        self.hooks
+            .fire(
+                openbuild_hooks::Event::PostToolUse,
+                &call.name,
+                &post_payload,
+            )
+            .await;
+        ToolResult {
+            call_id: call.id,
+            content,
+            is_error,
         }
     }
 }
@@ -599,15 +675,58 @@ async fn main() -> Result<()> {
         engine.add_deny(r)?;
     }
 
+    let hooks = Arc::new(openbuild_hooks::Registry::discover().unwrap_or_default());
+    if !hooks.hooks.is_empty() {
+        eprintln!("[hooks] {} hook(s) loaded", hooks.hooks.len());
+    }
+    let session_payload =
+        serde_json::json!({"cwd": std::env::current_dir().ok().map(|p| p.display().to_string())});
+    hooks
+        .fire(openbuild_hooks::Event::SessionStart, "", &session_payload)
+        .await;
+    let user_prompt_payload = serde_json::json!({"prompt": prompt.clone()});
+    hooks
+        .fire(
+            openbuild_hooks::Event::UserPromptSubmit,
+            "",
+            &user_prompt_payload,
+        )
+        .await;
     let tool_names = runner_tools_snapshot(&tools);
     let runner = Arc::new(GatedTools {
         tools,
         engine,
         secret_filter: openbuild_redact::Filter::new(),
+        hooks: hooks.clone(),
     });
 
     if cli.restore_code && (cli.resume.is_some() || cli.continue_recent) {
-        eprintln!("[restore-code] noted; git checkout to source commit pending v0.2");
+        let resume_path = if let Some(id) = cli.resume.as_deref() {
+            if id.is_empty() {
+                openbuild_session::most_recent()?
+            } else {
+                openbuild_session::find_by_id(id)?
+            }
+        } else {
+            openbuild_session::most_recent()?
+        };
+        if let Some(p) = resume_path {
+            if let Ok(text) = std::fs::read_to_string(&p) {
+                for line in text.lines() {
+                    let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+                        continue;
+                    };
+                    if v.get("type").and_then(|t| t.as_str()) == Some("session_start") {
+                        if let Some(sha) = v.get("git_head").and_then(|s| s.as_str()) {
+                            let cwd = std::env::current_dir()?;
+                            git_checkout(&cwd, sha)?;
+                            eprintln!("[restore-code] checked out {sha}");
+                        }
+                        break;
+                    }
+                }
+            }
+        }
     }
 
     let agent = AgentLoop {
@@ -694,12 +813,22 @@ async fn main() -> Result<()> {
         session,
     };
 
-    if let Some(n) = cli.best_of_n {
+    let outcome = if let Some(n) = cli.best_of_n {
         run_best_of_n(agent, req, n, sink).await
     } else {
-        agent.run(req, sink).await?;
-        Ok(())
-    }
+        agent.run(req, sink).await.map(|_| ()).map_err(Into::into)
+    };
+    hooks
+        .fire(openbuild_hooks::Event::Stop, "", &serde_json::json!({}))
+        .await;
+    hooks
+        .fire(
+            openbuild_hooks::Event::SessionEnd,
+            "",
+            &serde_json::json!({}),
+        )
+        .await;
+    outcome
 }
 
 fn resolve_prompt(cli: &Cli) -> Result<String> {
@@ -808,7 +937,72 @@ async fn run_subcommand(cmd: &Cmd) -> Result<()> {
         Cmd::Import { action } => cmd_import(action),
         Cmd::Trace { action } => cmd_trace(action),
         Cmd::Agent { action } => cmd_agent_ipc(action).await,
+        Cmd::Hooks { action } => cmd_hooks(action).await,
+        Cmd::Setup => cmd_setup(),
+        Cmd::Update => cmd_update(),
     }
+}
+
+async fn cmd_hooks(action: &HooksCmd) -> Result<()> {
+    let reg = openbuild_hooks::Registry::discover()?;
+    match action {
+        HooksCmd::List => {
+            println!("loaded {} hooks", reg.hooks.len());
+            for h in &reg.hooks {
+                println!(
+                    "  [{:?}] matcher={:?} timeout={}ms blocking={} cmd={}",
+                    h.event, h.matcher, h.timeout_ms, h.blocking, h.command
+                );
+            }
+        }
+        HooksCmd::Test { event, matcher } => {
+            let ev = match event.as_str() {
+                "PreToolUse" => openbuild_hooks::Event::PreToolUse,
+                "PostToolUse" => openbuild_hooks::Event::PostToolUse,
+                "Stop" => openbuild_hooks::Event::Stop,
+                "SessionStart" => openbuild_hooks::Event::SessionStart,
+                "SessionEnd" => openbuild_hooks::Event::SessionEnd,
+                "UserPromptSubmit" => openbuild_hooks::Event::UserPromptSubmit,
+                "PreCompact" => openbuild_hooks::Event::PreCompact,
+                "Notification" => openbuild_hooks::Event::Notification,
+                _ => anyhow::bail!("unknown event: {event}"),
+            };
+            let payload = serde_json::json!({"matcher": matcher});
+            for outcome in reg.fire(ev, matcher, &payload).await {
+                println!(
+                    "cmd={} exit={} blocked={}",
+                    outcome.command, outcome.exit_code, outcome.blocked
+                );
+                if !outcome.stdout.is_empty() {
+                    println!("stdout: {}", outcome.stdout);
+                }
+                if !outcome.stderr.is_empty() {
+                    eprintln!("stderr: {}", outcome.stderr);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn cmd_setup() -> Result<()> {
+    let home = dirs::home_dir().context("no home dir")?;
+    let dir = home.join(".openbuild");
+    for sub in ["", "sessions", "skills", "agents", "hooks", "sandbox"] {
+        std::fs::create_dir_all(dir.join(sub))?;
+    }
+    let config = dir.join("config.toml");
+    if !config.exists() {
+        std::fs::write(&config, "[cli]\nprovider = \"openai\"\n\n[mcp_servers]\n")?;
+    }
+    println!("openbuild setup complete at {}", dir.display());
+    Ok(())
+}
+
+fn cmd_update() -> Result<()> {
+    println!("openbuild update: install via `cargo install --git https://github.com/rohitg00/openbuild openbuild-cli`");
+    println!("auto-update not enabled (zero phone-home policy)");
+    Ok(())
 }
 
 fn cmd_agents(action: &AgentsCmd) -> Result<()> {
@@ -858,49 +1052,95 @@ fn cmd_memory(action: &MemoryCmd) -> Result<()> {
 
 fn cmd_import(action: &ImportCmd) -> Result<()> {
     match action {
-        ImportCmd::Claude { path } => {
-            let text = std::fs::read_to_string(path)
-                .with_context(|| format!("read {}", path.display()))?;
-            let dest_dir = openbuild_session::sessions_dir()?;
-            std::fs::create_dir_all(&dest_dir)?;
-            let new_id = uuid::Uuid::new_v4();
-            let dest = dest_dir.join(format!("{new_id}.jsonl"));
-            let mut out = String::new();
-            out.push_str(
-                &serde_json::json!({
-                    "type": "session_start",
-                    "id": new_id.to_string(),
-                    "imported_from": path.display().to_string(),
-                    "agent": "claude",
-                })
-                .to_string(),
-            );
+        ImportCmd::Claude { path } => import_session(path, "claude", claude_event_map),
+        ImportCmd::Cursor { path } => import_session(path, "cursor", cursor_event_map),
+        ImportCmd::Codex { path } => import_session(path, "codex", codex_event_map),
+        ImportCmd::OpenCode { path } => import_session(path, "opencode", opencode_event_map),
+    }
+}
+
+fn import_session(
+    path: &std::path::Path,
+    agent: &str,
+    map_fn: fn(&serde_json::Value) -> Option<&'static str>,
+) -> Result<()> {
+    let text = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    let dest_dir = openbuild_session::sessions_dir()?;
+    std::fs::create_dir_all(&dest_dir)?;
+    let new_id = uuid::Uuid::new_v4();
+    let dest = dest_dir.join(format!("{new_id}.jsonl"));
+    let mut out = String::new();
+    out.push_str(
+        &serde_json::json!({
+            "type": "session_start",
+            "id": new_id.to_string(),
+            "imported_from": path.display().to_string(),
+            "agent": agent,
+        })
+        .to_string(),
+    );
+    out.push('\n');
+    for line in text.lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if let Some(mapped) = map_fn(&v) {
+            let entry = serde_json::json!({"type": mapped, "payload": v});
+            out.push_str(&entry.to_string());
             out.push('\n');
-            for line in text.lines() {
-                let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
-                    continue;
-                };
-                if let Some(t) = v.get("type").and_then(|t| t.as_str()) {
-                    let mapped = match t {
-                        "user" => "user_message",
-                        "assistant" => "assistant_message",
-                        "summary" => "summary",
-                        _ => continue,
-                    };
-                    let entry = serde_json::json!({
-                        "type": mapped,
-                        "original_type": t,
-                        "payload": v,
-                    });
-                    out.push_str(&entry.to_string());
-                    out.push('\n');
-                }
-            }
-            std::fs::write(&dest, out)?;
-            println!("imported -> {}", dest.display());
         }
     }
+    std::fs::write(&dest, out)?;
+    println!("imported -> {}", dest.display());
     Ok(())
+}
+
+fn claude_event_map(v: &serde_json::Value) -> Option<&'static str> {
+    match v.get("type").and_then(|t| t.as_str())? {
+        "user" => Some("user_message"),
+        "assistant" => Some("assistant_message"),
+        "summary" => Some("summary"),
+        _ => None,
+    }
+}
+
+fn cursor_event_map(v: &serde_json::Value) -> Option<&'static str> {
+    let role = v
+        .get("role")
+        .and_then(|r| r.as_str())
+        .or_else(|| v.get("type").and_then(|t| t.as_str()))?;
+    match role {
+        "user" => Some("user_message"),
+        "assistant" | "ai" => Some("assistant_message"),
+        "tool" | "tool_result" => Some("tool_result"),
+        _ => None,
+    }
+}
+
+fn codex_event_map(v: &serde_json::Value) -> Option<&'static str> {
+    match v.get("type").and_then(|t| t.as_str())? {
+        "message" => {
+            let role = v.get("role").and_then(|r| r.as_str()).unwrap_or("");
+            match role {
+                "user" => Some("user_message"),
+                "assistant" => Some("assistant_message"),
+                _ => None,
+            }
+        }
+        "tool_call" => Some("tool_call"),
+        "tool_result" => Some("tool_result"),
+        _ => None,
+    }
+}
+
+fn opencode_event_map(v: &serde_json::Value) -> Option<&'static str> {
+    let role = v.get("role").and_then(|r| r.as_str())?;
+    match role {
+        "user" => Some("user_message"),
+        "assistant" => Some("assistant_message"),
+        "tool" => Some("tool_result"),
+        _ => None,
+    }
 }
 
 fn cmd_trace(action: &TraceCmd) -> Result<()> {
@@ -938,6 +1178,9 @@ async fn cmd_agent_ipc(action: &AgentRunCmd) -> Result<()> {
             use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
             let mut stdin = BufReader::new(tokio::io::stdin()).lines();
             let mut stdout = tokio::io::stdout();
+            let ready = serde_json::json!({"type":"ready","protocol":"openbuild-ipc/v0"});
+            stdout.write_all(ready.to_string().as_bytes()).await?;
+            stdout.write_all(b"\n").await?;
             while let Ok(Some(line)) = stdin.next_line().await {
                 let req: serde_json::Value = match serde_json::from_str(&line) {
                     Ok(v) => v,
@@ -962,7 +1205,60 @@ async fn cmd_agent_ipc(action: &AgentRunCmd) -> Result<()> {
             }
             Ok(())
         }
+        AgentRunCmd::Serve { host, port } => agent_serve(host, *port).await,
     }
+}
+
+async fn agent_serve(host: &str, port: u16) -> Result<()> {
+    let listener = tokio::net::TcpListener::bind((host, port)).await?;
+    eprintln!("openbuild agent serve: listening on {host}:{port}");
+    loop {
+        let (mut sock, peer) = listener.accept().await?;
+        tokio::spawn(async move {
+            use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+            let (rd, mut wr) = sock.split();
+            let mut lines = BufReader::new(rd).lines();
+            let ready = serde_json::json!({"type":"ready","peer":format!("{peer}"),"protocol":"openbuild-ipc/v0"});
+            let _ = wr.write_all(ready.to_string().as_bytes()).await;
+            let _ = wr.write_all(b"\n").await;
+            while let Ok(Some(line)) = lines.next_line().await {
+                let req: serde_json::Value = match serde_json::from_str(&line) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        let err = serde_json::json!({"type":"error","error":e.to_string()});
+                        let _ = wr.write_all(err.to_string().as_bytes()).await;
+                        let _ = wr.write_all(b"\n").await;
+                        continue;
+                    }
+                };
+                let prompt = req
+                    .get("prompt")
+                    .and_then(|p| p.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let ack = serde_json::json!({
+                    "type": "ack",
+                    "received_prompt_len": prompt.len(),
+                });
+                let _ = wr.write_all(ack.to_string().as_bytes()).await;
+                let _ = wr.write_all(b"\n").await;
+            }
+        });
+    }
+}
+
+fn git_checkout(cwd: &std::path::Path, sha: &str) -> Result<()> {
+    let status = std::process::Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .arg("checkout")
+        .arg(sha)
+        .status()
+        .context("git checkout")?;
+    if !status.success() {
+        anyhow::bail!("git checkout {sha} failed");
+    }
+    Ok(())
 }
 
 fn runner_tools_snapshot(tools: &[Box<dyn Tool>]) -> Vec<String> {
@@ -1086,15 +1382,121 @@ async fn cmd_mcp(action: &McpCmd) -> Result<()> {
                             Err(e) => println!("FAIL spawn: {e}"),
                         }
                     }
-                    openbuild_config::McpServer::Http { url }
-                    | openbuild_config::McpServer::Sse { url } => {
-                        println!("{name} (http/sse: {url}) — pending in v0.1");
+                    openbuild_config::McpServer::Http { url } => {
+                        print!("{name} (http: {url}) ... ");
+                        std::io::stdout().flush().ok();
+                        match openbuild_mcp::HttpClient::connect(url).await {
+                            Ok(c) => match c.list_tools().await {
+                                Ok(tools) => println!("ok ({} tools)", tools.len()),
+                                Err(e) => println!("FAIL list_tools: {e}"),
+                            },
+                            Err(e) => println!("FAIL connect: {e}"),
+                        }
+                    }
+                    openbuild_config::McpServer::Sse { url } => {
+                        println!("{name} (sse: {url}) — uses HTTP streamable transport");
                     }
                 }
             }
         }
+        McpCmd::Add {
+            name,
+            command,
+            args,
+        } => {
+            user_config_add_mcp_stdio(name, command, args)?;
+            println!("added stdio MCP server '{name}'");
+        }
+        McpCmd::AddHttp { name, url } => {
+            user_config_add_mcp_http(name, url, "http")?;
+            println!("added http MCP server '{name}'");
+        }
+        McpCmd::AddSse { name, url } => {
+            user_config_add_mcp_http(name, url, "sse")?;
+            println!("added sse MCP server '{name}'");
+        }
+        McpCmd::Remove { name } => {
+            let removed = user_config_remove_mcp(name)?;
+            println!("removed: {removed}");
+        }
     }
     Ok(())
+}
+
+fn user_config_path() -> Result<PathBuf> {
+    Ok(dirs::home_dir()
+        .context("no home dir")?
+        .join(".openbuild")
+        .join("config.toml"))
+}
+
+fn read_user_config() -> Result<toml::Value> {
+    let path = user_config_path()?;
+    if !path.exists() {
+        return Ok(toml::Value::Table(toml::value::Table::new()));
+    }
+    let text = std::fs::read_to_string(&path)?;
+    Ok(toml::from_str(&text).unwrap_or(toml::Value::Table(toml::value::Table::new())))
+}
+
+fn write_user_config(v: &toml::Value) -> Result<()> {
+    let path = user_config_path()?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&path, toml::to_string_pretty(v)?)?;
+    Ok(())
+}
+
+fn user_config_add_mcp_stdio(name: &str, command: &str, args: &[String]) -> Result<()> {
+    let mut cfg = read_user_config()?;
+    let table = cfg.as_table_mut().context("config root must be table")?;
+    let servers = table
+        .entry("mcp_servers".to_string())
+        .or_insert_with(|| toml::Value::Table(toml::value::Table::new()))
+        .as_table_mut()
+        .context("mcp_servers must be table")?;
+    let mut entry = toml::value::Table::new();
+    entry.insert("type".into(), toml::Value::String("stdio".into()));
+    entry.insert("command".into(), toml::Value::String(command.into()));
+    entry.insert(
+        "args".into(),
+        toml::Value::Array(
+            args.iter()
+                .map(|a| toml::Value::String(a.clone()))
+                .collect(),
+        ),
+    );
+    servers.insert(name.into(), toml::Value::Table(entry));
+    write_user_config(&cfg)
+}
+
+fn user_config_add_mcp_http(name: &str, url: &str, kind: &str) -> Result<()> {
+    let mut cfg = read_user_config()?;
+    let table = cfg.as_table_mut().context("config root must be table")?;
+    let servers = table
+        .entry("mcp_servers".to_string())
+        .or_insert_with(|| toml::Value::Table(toml::value::Table::new()))
+        .as_table_mut()
+        .context("mcp_servers must be table")?;
+    let mut entry = toml::value::Table::new();
+    entry.insert("type".into(), toml::Value::String(kind.into()));
+    entry.insert("url".into(), toml::Value::String(url.into()));
+    servers.insert(name.into(), toml::Value::Table(entry));
+    write_user_config(&cfg)
+}
+
+fn user_config_remove_mcp(name: &str) -> Result<bool> {
+    let mut cfg = read_user_config()?;
+    let Some(table) = cfg.as_table_mut() else {
+        return Ok(false);
+    };
+    let Some(servers) = table.get_mut("mcp_servers").and_then(|v| v.as_table_mut()) else {
+        return Ok(false);
+    };
+    let existed = servers.remove(name).is_some();
+    write_user_config(&cfg)?;
+    Ok(existed)
 }
 
 fn cmd_skills(action: &SkillsCmd) -> Result<()> {

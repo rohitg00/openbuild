@@ -13,3 +13,6 @@ openbuild-core.workspace = true
 serde.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+which = "6"

@@ -83,9 +83,39 @@ pub fn wrap_command(profile: &Profile, mut cmd: Vec<String>) -> Result<Vec<Strin
     Ok(wrapped)
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
+pub fn wrap_command(profile: &Profile, mut cmd: Vec<String>) -> Result<Vec<String>> {
+    if which::which("bwrap").is_ok() {
+        let mut wrapped = vec![
+            "bwrap".to_string(),
+            "--ro-bind".into(),
+            "/".into(),
+            "/".into(),
+            "--proc".into(),
+            "/proc".into(),
+            "--dev".into(),
+            "/dev".into(),
+            "--tmpfs".into(),
+            "/tmp".into(),
+        ];
+        if profile.restrict_network {
+            wrapped.push("--unshare-net".into());
+        }
+        for ro in &profile.read_only_paths {
+            wrapped.push("--ro-bind".into());
+            wrapped.push(ro.display().to_string());
+            wrapped.push(ro.display().to_string());
+        }
+        wrapped.push("--".into());
+        wrapped.append(&mut cmd);
+        return Ok(wrapped);
+    }
+    eprintln!("[sandbox] bwrap not found, running without isolation");
+    Ok(cmd)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 pub fn wrap_command(_profile: &Profile, cmd: Vec<String>) -> Result<Vec<String>> {
-    // Linux landlock+seccomp would go here. Pending v0.2.
     Ok(cmd)
 }
 

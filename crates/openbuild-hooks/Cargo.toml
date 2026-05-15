@@ -1,19 +1,18 @@
 [package]
-name = "openbuild-mcp"
+name = "openbuild-hooks"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
 rust-version.workspace = true
-description = "MCP client (stdio + http + sse)"
+description = "Hooks system: PreToolUse, PostToolUse, Stop, SessionStart, SessionEnd, UserPromptSubmit, PreCompact, Notification"
 
 [dependencies]
-openbuild-core.workspace = true
-tokio = { workspace = true, features = ["process", "macros", "rt", "io-util", "sync"] }
 serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
-thiserror.workspace = true
+tokio = { workspace = true, features = ["process", "io-util", "macros", "rt"] }
 tracing.workspace = true
-reqwest.workspace = true
+regex.workspace = true
+dirs.workspace = true

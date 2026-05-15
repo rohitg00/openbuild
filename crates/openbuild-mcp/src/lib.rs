@@ -163,6 +163,106 @@ impl StdioClient {
     }
 }
 
+pub struct HttpClient {
+    url: String,
+    http: reqwest::Client,
+    next_id: AtomicU64,
+}
+
+impl HttpClient {
+    pub async fn connect(url: &str) -> Result<Arc<Self>> {
+        let client = Arc::new(Self {
+            url: url.to_string(),
+            http: reqwest::Client::builder()
+                .user_agent("openbuild/0.0.1")
+                .build()?,
+            next_id: AtomicU64::new(1),
+        });
+        client.initialize().await?;
+        Ok(client)
+    }
+
+    async fn initialize(&self) -> Result<()> {
+        let params = serde_json::json!({
+            "protocolVersion": PROTOCOL_VERSION,
+            "capabilities": {"tools": {}},
+            "clientInfo": {"name": "openbuild", "version": env!("CARGO_PKG_VERSION")},
+        });
+        let _ = self.call("initialize", Some(params)).await?;
+        Ok(())
+    }
+
+    pub async fn list_tools(&self) -> Result<Vec<McpTool>> {
+        let v = self.call("tools/list", None).await?;
+        let tools = v
+            .get("tools")
+            .ok_or_else(|| anyhow!("tools/list missing tools"))?
+            .clone();
+        Ok(serde_json::from_value(tools)?)
+    }
+
+    pub async fn call_tool(&self, name: &str, args: serde_json::Value) -> Result<String> {
+        let params = serde_json::json!({"name": name, "arguments": args});
+        let v = self.call("tools/call", Some(params)).await?;
+        if let Some(content) = v.get("content").and_then(|c| c.as_array()) {
+            let mut out = String::new();
+            for item in content {
+                if let Some(t) = item.get("text").and_then(|t| t.as_str()) {
+                    out.push_str(t);
+                }
+            }
+            return Ok(out);
+        }
+        Ok(v.to_string())
+    }
+
+    async fn call(
+        &self,
+        method: &str,
+        params: Option<serde_json::Value>,
+    ) -> Result<serde_json::Value> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let req = Request {
+            jsonrpc: "2.0",
+            id,
+            method,
+            params,
+        };
+        let resp = self
+            .http
+            .post(&self.url)
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .json(&req)
+            .send()
+            .await?;
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let body = resp.text().await?;
+        let parsed: Response = if ct.contains("text/event-stream") {
+            let mut data = String::new();
+            for line in body.lines() {
+                if let Some(rest) = line.strip_prefix("data:") {
+                    let rest = rest.strip_prefix(' ').unwrap_or(rest);
+                    data.push_str(rest);
+                }
+            }
+            serde_json::from_str(&data)?
+        } else {
+            serde_json::from_str(&body)?
+        };
+        match (parsed.result, parsed.error) {
+            (_, Some(e)) => Err(anyhow!("mcp http error {}: {}", e.code, e.message)),
+            (Some(v), None) => Ok(v),
+            (None, None) => Err(anyhow!("mcp http response missing result and error")),
+        }
+    }
+}
+
 async fn reader_loop(
     stdout: ChildStdout,
     pending: Arc<Mutex<BTreeMap<u64, oneshot::Sender<Result<serde_json::Value>>>>>,

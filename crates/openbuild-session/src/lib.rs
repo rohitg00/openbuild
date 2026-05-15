@@ -98,11 +98,20 @@ impl Session {
     }
 
     fn append_header(&mut self) -> Result<()> {
+        let git_head = std::process::Command::new("git")
+            .arg("rev-parse")
+            .arg("HEAD")
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
         let header = serde_json::json!({
             "type": "session_start",
             "id": self.id.to_string(),
             "started_at": chrono::Utc::now().to_rfc3339(),
             "version": env!("CARGO_PKG_VERSION"),
+            "cwd": std::env::current_dir().ok().map(|p| p.display().to_string()),
+            "git_head": git_head,
         });
         writeln!(self.file, "{header}")?;
         Ok(())
