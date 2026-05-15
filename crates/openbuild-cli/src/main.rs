@@ -1388,8 +1388,12 @@ async fn cmd_tui() -> Result<()> {
 
     struct ChatBackend {
         agent: Arc<AgentLoop>,
+        provider_name: String,
         model: String,
         history: Vec<Message>,
+        tokens_in: std::sync::Arc<std::sync::atomic::AtomicU64>,
+        tokens_out: std::sync::Arc<std::sync::atomic::AtomicU64>,
+        turn: std::sync::Arc<std::sync::atomic::AtomicU32>,
     }
 
     #[async_trait]
@@ -1400,6 +1404,7 @@ async fn cmd_tui() -> Result<()> {
             out: tokio::sync::mpsc::Sender<openbuild_core::Event>,
         ) {
             self.history.push(Message::user_text(prompt));
+            self.turn.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let req = Request {
                 model: self.model.clone(),
                 system: vec![],
@@ -1413,21 +1418,41 @@ async fn cmd_tui() -> Result<()> {
                 seed: None,
                 stop: Vec::new(),
             };
-            struct Forward(tokio::sync::mpsc::Sender<openbuild_core::Event>);
+            struct Forward {
+                tx: tokio::sync::mpsc::Sender<openbuild_core::Event>,
+                tokens_in: std::sync::Arc<std::sync::atomic::AtomicU64>,
+                tokens_out: std::sync::Arc<std::sync::atomic::AtomicU64>,
+            }
             #[async_trait]
             impl openbuild_core::Sink for Forward {
                 async fn on(&mut self, ev: openbuild_core::Event) {
-                    let _ = self.0.send(ev).await;
+                    if let openbuild_core::Event::Usage(u) = &ev {
+                        self.tokens_in
+                            .fetch_add(u.input_tokens as u64, std::sync::atomic::Ordering::Relaxed);
+                        self.tokens_out.fetch_add(
+                            u.output_tokens as u64,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                    }
+                    let _ = self.tx.send(ev).await;
                 }
             }
-            let sink = Forward(out);
+            let sink = Forward {
+                tx: out,
+                tokens_in: self.tokens_in.clone(),
+                tokens_out: self.tokens_out.clone(),
+            };
             let _ = self.agent.run(req, sink).await;
         }
 
         fn slash(&mut self, cmd: &str, arg: &str) -> Option<String> {
             match cmd {
-                "/help" => Some("/quit /clear /cost /agent NAME /model NAME /help".into()),
-                "/cost" => Some("(cost tracker — pending TUI integration)".into()),
+                "/cost" => Some(format!(
+                    "input {} · output {} · turn {}",
+                    self.tokens_in.load(std::sync::atomic::Ordering::Relaxed),
+                    self.tokens_out.load(std::sync::atomic::Ordering::Relaxed),
+                    self.turn.load(std::sync::atomic::Ordering::Relaxed),
+                )),
                 "/model" => {
                     if arg.is_empty() {
                         Some(format!("current model: {}", self.model))
@@ -1443,15 +1468,26 @@ async fn cmd_tui() -> Result<()> {
             }
         }
 
-        fn header(&self) -> String {
-            format!("openbuild — {}", self.model)
+        fn status(&self) -> openbuild_tui::Status {
+            openbuild_tui::Status {
+                provider: self.provider_name.clone(),
+                model: self.model.clone(),
+                mode: "bypass".into(),
+                input_tokens: self.tokens_in.load(std::sync::atomic::Ordering::Relaxed),
+                output_tokens: self.tokens_out.load(std::sync::atomic::Ordering::Relaxed),
+                turn: self.turn.load(std::sync::atomic::Ordering::Relaxed),
+            }
         }
     }
 
     let mut backend = ChatBackend {
         agent,
+        provider_name,
         model,
         history: Vec::new(),
+        tokens_in: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        tokens_out: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        turn: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
     };
     openbuild_tui::run_streaming(&mut backend, true).await
 }
