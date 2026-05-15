@@ -10,6 +10,7 @@ description = "Builtin tools: read/write/edit/bash/grep/glob/list_dir/web_*"
 
 [dependencies]
 openbuild-core.workspace = true
+openbuild-sandbox.workspace = true
 tokio = { workspace = true }
 async-trait.workspace = true
 serde.workspace = true
@@ -18,3 +19,5 @@ anyhow.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 regex.workspace = true
+globset = "0.4"
+ignore = "0.4"

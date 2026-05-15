@@ -1,0 +1,15 @@
+{
+  "version": "public",
+  "checksums": {
+    "agents/explore.md": "3504967d7a173cf2a024abfb20384517836c706b5e33e4124000514d895b1859",
+    "agents/general.md": "408162c94130ba7b43897be9ddc7e19666119196ecfb3be1968fa51087c3b7fd",
+    "agents/plan.md": "23f76796389a941d17299bb3e11bdfa7b37636f9c18b39f52dde4522dfeaf260",
+    "roles/implementer.toml": "e2806a4c08682181f25f68667c14e8750c67fe5f5f50fc9a00fdf404c70dcdf7",
+    "roles/explore.toml": "d23c051f21f08f4a60fb2252383272802e8b6ff84930dcce2d4b0095966e7ed2",
+    "roles/plan.toml": "e9f41f9f8018de694a3ef69e102583e81d906956cf8f3ef94f5caa6e37882d50",
+    "personas/reviewer.toml": "12d2dd981771f249a7d5742f90cbc85c8a3c2ef017fdaaeb4056a43b97d72625",
+    "personas/researcher.toml": "daeaa4e9bee512f1563a69dab84f6728e9138f4ab2ff04c2586786ec2de15e42",
+    "personas/implementer.toml": "9aea9d9337d8feb36d2612ea178f8b7d9e4a79c038ee39627bdd08a02d5af094",
+    "skills/check/SKILL.md": "8ae14216dc5046ae2f0627dac5859a716cae83f979227c115f3b05af92926f00"
+  }
+}

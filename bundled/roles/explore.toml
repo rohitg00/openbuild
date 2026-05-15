@@ -1,0 +1,3 @@
+description = "Fast read-only codebase explorer"
+default_capability_mode = "read-only"
+reasoning_effort = "medium"

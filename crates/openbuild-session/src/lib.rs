@@ -3,7 +3,59 @@ use openbuild_core::Event;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 use uuid::Uuid;
+
+pub fn sessions_dir() -> Result<PathBuf> {
+    let dir = dirs::home_dir()
+        .context("home dir not found")?
+        .join(".openbuild")
+        .join("sessions");
+    Ok(dir)
+}
+
+pub fn most_recent() -> Result<Option<PathBuf>> {
+    let dir = sessions_dir()?;
+    if !dir.exists() {
+        return Ok(None);
+    }
+    let mut best: Option<(SystemTime, PathBuf)> = None;
+    for entry in std::fs::read_dir(&dir)?.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let mt = entry
+            .metadata()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        let replace = match &best {
+            None => true,
+            Some((b, _)) => mt > *b,
+        };
+        if replace {
+            best = Some((mt, path));
+        }
+    }
+    Ok(best.map(|(_, p)| p))
+}
+
+pub fn find_by_id(id: &str) -> Result<Option<PathBuf>> {
+    let dir = sessions_dir()?;
+    if !dir.exists() {
+        return Ok(None);
+    }
+    for entry in std::fs::read_dir(&dir)?.flatten() {
+        let path = entry.path();
+        if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+            if stem == id || stem.starts_with(id) {
+                return Ok(Some(path));
+            }
+        }
+    }
+    Ok(None)
+}
 
 pub struct Session {
     id: Uuid,

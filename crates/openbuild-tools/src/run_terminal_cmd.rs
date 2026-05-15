@@ -4,7 +4,10 @@ use openbuild_core::tool::ToolSchema;
 use serde::Deserialize;
 use tokio::process::Command;
 
-pub struct RunTerminalCmd;
+#[derive(Default)]
+pub struct RunTerminalCmd {
+    pub sandbox_profile: Option<openbuild_sandbox::Profile>,
+}
 
 #[derive(Deserialize)]
 struct Input {
@@ -37,7 +40,15 @@ impl Tool for RunTerminalCmd {
     async fn run(&self, input: serde_json::Value) -> Result<String, String> {
         let i: Input = serde_json::from_value(input).map_err(|e| e.to_string())?;
         let dur = std::time::Duration::from_millis(i.timeout_ms);
-        let fut = Command::new("sh").arg("-c").arg(&i.command).output();
+        let argv: Vec<String> = vec!["sh".into(), "-c".into(), i.command.clone()];
+        let argv = if let Some(p) = &self.sandbox_profile {
+            openbuild_sandbox::wrap_command(p, argv).map_err(|e| e.to_string())?
+        } else {
+            argv
+        };
+        let mut cmd = Command::new(&argv[0]);
+        cmd.args(&argv[1..]);
+        let fut = cmd.output();
         let out = tokio::time::timeout(dur, fut)
             .await
             .map_err(|_| "command timed out".to_string())?
