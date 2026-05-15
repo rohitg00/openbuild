@@ -89,6 +89,12 @@ impl Engine {
                 return Decision::Deny;
             }
         }
+        if matches!(self.mode, Mode::Plan) {
+            if is_write || is_side_effect_tool(tool) {
+                return Decision::Plan;
+            }
+            return Decision::Allow;
+        }
         if self.allow.iter().any(|r| r.matches(tool, args)) {
             return Decision::Allow;
         }
@@ -106,6 +112,13 @@ impl Engine {
             Mode::Default => Decision::Ask,
         }
     }
+}
+
+fn is_side_effect_tool(tool: &str) -> bool {
+    matches!(
+        tool,
+        "run_terminal_cmd" | "bash" | "write_file" | "edit_file" | "multi_edit"
+    )
 }
 
 fn glob_match(pattern: &str, s: &str) -> bool {
@@ -194,7 +207,17 @@ mod tests {
         assert_eq!(e.evaluate("X", &json!({}), false), Decision::Allow);
         e.mode = Mode::Default;
         assert_eq!(e.evaluate("X", &json!({}), false), Decision::Ask);
-        e.mode = Mode::Plan;
-        assert_eq!(e.evaluate("X", &json!({}), false), Decision::Plan);
+    }
+
+    #[test]
+    fn plan_mode_blocks_writes() {
+        let e = Engine {
+            mode: Mode::Plan,
+            ..Default::default()
+        };
+        assert_eq!(e.evaluate("read_file", &json!({}), false), Decision::Allow);
+        assert_eq!(e.evaluate("write_file", &json!({}), true), Decision::Plan);
+        assert_eq!(e.evaluate("bash", &json!("ls"), false), Decision::Plan);
+        assert_eq!(e.evaluate("grep", &json!({}), false), Decision::Allow);
     }
 }

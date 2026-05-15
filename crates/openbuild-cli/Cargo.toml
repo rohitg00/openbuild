@@ -25,6 +25,7 @@ openbuild-sandbox.workspace = true
 openbuild-agents.workspace = true
 openbuild-memory.workspace = true
 openbuild-hooks.workspace = true
+openbuild-tui.workspace = true
 regex.workspace = true
 toml.workspace = true
 reqwest.workspace = true

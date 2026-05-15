@@ -108,6 +108,19 @@ async fn run_hook(hook: &Hook, payload: &serde_json::Value) -> HookOutcome {
     cmd.stdin(Stdio::piped());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
+    cmd.env("OPENBUILD_HOOK_EVENT", format!("{:?}", hook.event));
+    if let Some(tool) = payload.get("tool_name").and_then(|v| v.as_str()) {
+        cmd.env("OPENBUILD_TOOL_NAME", tool);
+    }
+    if let Some(id) = payload.get("tool_use_id").and_then(|v| v.as_str()) {
+        cmd.env("OPENBUILD_TOOL_USE_ID", id);
+    }
+    if let Some(cwd) = std::env::current_dir()
+        .ok()
+        .and_then(|p| p.to_str().map(str::to_string))
+    {
+        cmd.env("OPENBUILD_CWD", cwd);
+    }
     let child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {

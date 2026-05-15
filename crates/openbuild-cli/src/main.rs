@@ -141,7 +141,10 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Cmd {
     Inspect,
-    Models,
+    Models {
+        #[command(subcommand)]
+        action: Option<ModelsCmd>,
+    },
     Sessions {
         #[command(subcommand)]
         action: SessionsCmd,
@@ -178,8 +181,35 @@ enum Cmd {
         #[command(subcommand)]
         action: HooksCmd,
     },
+    Tui,
     Setup,
     Update,
+    Sandbox {
+        #[command(subcommand)]
+        action: SandboxCmd,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ModelsCmd {
+    Live {
+        #[arg(long, env = "OPENBUILD_PROVIDER", default_value = "openai")]
+        provider: String,
+        #[arg(
+            long,
+            env = "OPENBUILD_BASE_URL",
+            default_value = "https://api.openai.com/v1"
+        )]
+        base_url: String,
+        #[arg(long, env = "OPENBUILD_API_KEY")]
+        api_key: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum SandboxCmd {
+    List,
+    Show { name: String },
 }
 
 #[derive(Subcommand, Debug)]
@@ -224,13 +254,41 @@ enum McpCmd {
 #[derive(Subcommand, Debug)]
 enum SkillsCmd {
     List,
-    Show { name: String },
+    Show {
+        name: String,
+    },
+    Install {
+        source: String,
+        #[arg(long)]
+        name: Option<String>,
+    },
+    Remove {
+        name: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
 enum AgentsCmd {
     List,
-    Show { name: String },
+    Show {
+        name: String,
+    },
+    Add {
+        name: String,
+        #[arg(long)]
+        description: Option<String>,
+        #[arg(long)]
+        capability: Option<String>,
+        #[arg(long)]
+        permission_mode: Option<String>,
+        #[arg(long)]
+        prompt: Option<String>,
+        #[arg(long)]
+        prompt_file: Option<PathBuf>,
+    },
+    Remove {
+        name: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -349,6 +407,13 @@ impl ToolRunner for GatedTools {
                 is_error: true,
             };
         };
+        if let Err(msg) = validate_schema(&tool.schema().input_schema, &call.input) {
+            return ToolResult {
+                call_id: call.id,
+                content: format!("input failed schema validation: {msg}"),
+                is_error: true,
+            };
+        }
         let pre_payload = serde_json::json!({
             "tool_name": call.name,
             "tool_input": call.input,
@@ -374,7 +439,7 @@ impl ToolRunner for GatedTools {
             .engine
             .evaluate(&call.name, &call.input, tool.is_write());
         match decision {
-            Decision::Deny | Decision::Plan => {
+            Decision::Deny => {
                 return ToolResult {
                     call_id: call.id,
                     content: format!(
@@ -382,6 +447,17 @@ impl ToolRunner for GatedTools {
                         call.name, self.engine.mode
                     ),
                     is_error: true,
+                };
+            }
+            Decision::Plan => {
+                return ToolResult {
+                    call_id: call.id,
+                    content: format!(
+                        "[plan mode] would run {} with input {} — skipped (no side effects)",
+                        call.name,
+                        serde_json::to_string(&call.input).unwrap_or_default()
+                    ),
+                    is_error: false,
                 };
             }
             Decision::Ask => {
@@ -502,6 +578,42 @@ mod worktree {
         }
         Ok(target)
     }
+}
+
+fn validate_schema(schema: &serde_json::Value, input: &serde_json::Value) -> Result<(), String> {
+    let Some(required) = schema.get("required").and_then(|r| r.as_array()) else {
+        return Ok(());
+    };
+    let obj = input
+        .as_object()
+        .ok_or_else(|| "input must be an object".to_string())?;
+    for r in required {
+        let Some(key) = r.as_str() else { continue };
+        if !obj.contains_key(key) {
+            return Err(format!("missing required field: {key}"));
+        }
+    }
+    if let Some(props) = schema.get("properties").and_then(|p| p.as_object()) {
+        for (k, v) in obj {
+            if let Some(prop_schema) = props.get(k) {
+                if let Some(expected) = prop_schema.get("type").and_then(|t| t.as_str()) {
+                    let ok = match expected {
+                        "string" => v.is_string(),
+                        "integer" => v.is_i64() || v.is_u64(),
+                        "number" => v.is_number(),
+                        "boolean" => v.is_boolean(),
+                        "array" => v.is_array(),
+                        "object" => v.is_object(),
+                        _ => true,
+                    };
+                    if !ok {
+                        return Err(format!("field {k} must be {expected}"));
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 mod openbuild_redact {
@@ -928,7 +1040,14 @@ impl Sink for CollectSink {
 async fn run_subcommand(cmd: &Cmd) -> Result<()> {
     match cmd {
         Cmd::Inspect => cmd_inspect(),
-        Cmd::Models => cmd_models(),
+        Cmd::Models { action } => match action {
+            None => cmd_models(),
+            Some(ModelsCmd::Live {
+                provider,
+                base_url,
+                api_key,
+            }) => cmd_models_live(provider, base_url, api_key.as_deref().unwrap_or("")).await,
+        },
         Cmd::Sessions { action } => cmd_sessions(action),
         Cmd::Mcp { action } => cmd_mcp(action).await,
         Cmd::Skills { action } => cmd_skills(action),
@@ -940,7 +1059,57 @@ async fn run_subcommand(cmd: &Cmd) -> Result<()> {
         Cmd::Hooks { action } => cmd_hooks(action).await,
         Cmd::Setup => cmd_setup(),
         Cmd::Update => cmd_update(),
+        Cmd::Sandbox { action } => cmd_sandbox(action),
+        Cmd::Tui => cmd_tui(),
     }
+}
+
+fn cmd_tui() -> Result<()> {
+    struct EchoHandler;
+    impl openbuild_tui::LineHandler for EchoHandler {
+        fn handle(&mut self, line: &str) -> Vec<String> {
+            match line {
+                "/help" => vec![
+                    "/quit  exit".into(),
+                    "/help  show this".into(),
+                    "(real chat: use `openbuild -p \"...\"` until v0.2 TUI streaming lands)".into(),
+                ],
+                _ => vec![format!("(stub) noted: {line}")],
+            }
+        }
+        fn header(&self) -> String {
+            "openbuild tui (preview)".into()
+        }
+    }
+    let mut h = EchoHandler;
+    openbuild_tui::run(&mut h, true)
+}
+
+fn cmd_sandbox(action: &SandboxCmd) -> Result<()> {
+    let dir = dirs::home_dir()
+        .context("no home")?
+        .join(".openbuild")
+        .join("sandbox");
+    match action {
+        SandboxCmd::List => {
+            for builtin in ["off", "read-only", "workspace-write"] {
+                println!("{builtin}\tbuiltin");
+            }
+            if dir.exists() {
+                for e in std::fs::read_dir(&dir)?.flatten() {
+                    if let Some(stem) = e.path().file_stem().and_then(|s| s.to_str()) {
+                        println!("{stem}\tuser");
+                    }
+                }
+            }
+        }
+        SandboxCmd::Show { name } => {
+            let cwd = std::env::current_dir()?;
+            let p = openbuild_sandbox::discover_profile(name, &cwd);
+            println!("{}", toml::to_string_pretty(&p)?);
+        }
+    }
+    Ok(())
 }
 
 async fn cmd_hooks(action: &HooksCmd) -> Result<()> {
@@ -1019,6 +1188,55 @@ fn cmd_agents(action: &AgentsCmd) -> Result<()> {
         AgentsCmd::Show { name } => {
             let a = openbuild_agents::load_by_name(name, bundled.as_deref())?;
             println!("{}", a.system_prompt);
+        }
+        AgentsCmd::Add {
+            name,
+            description,
+            capability,
+            permission_mode,
+            prompt,
+            prompt_file,
+        } => {
+            let dir = dirs::home_dir()
+                .context("no home")?
+                .join(".openbuild")
+                .join("agents");
+            std::fs::create_dir_all(&dir)?;
+            let body = if let Some(p) = prompt_file {
+                std::fs::read_to_string(p)?
+            } else {
+                prompt.clone().unwrap_or_else(|| {
+                    format!("You are the '{name}' agent. Complete the user's task.")
+                })
+            };
+            let mut front = String::from("---\n");
+            front.push_str(&format!("name: {name}\n"));
+            if let Some(d) = description {
+                front.push_str(&format!("description: {d}\n"));
+            }
+            if let Some(c) = capability {
+                front.push_str(&format!("capability_mode: {c}\n"));
+            }
+            if let Some(pm) = permission_mode {
+                front.push_str(&format!("permission_mode: {pm}\n"));
+            }
+            front.push_str("---\n\n");
+            front.push_str(&body);
+            let path = dir.join(format!("{name}.md"));
+            std::fs::write(&path, front)?;
+            println!("wrote agent to {}", path.display());
+        }
+        AgentsCmd::Remove { name } => {
+            let dir = dirs::home_dir()
+                .context("no home")?
+                .join(".openbuild")
+                .join("agents");
+            let path = dir.join(format!("{name}.md"));
+            let existed = path.exists();
+            if existed {
+                std::fs::remove_file(&path)?;
+            }
+            println!("removed: {existed}");
         }
     }
     Ok(())
@@ -1320,6 +1538,43 @@ fn cmd_models() -> Result<()> {
     println!("  xai        https://api.x.ai/v1");
     println!("  ollama     http://localhost:11434/v1");
     println!("  + any OpenAI-compatible endpoint via --base-url");
+    println!();
+    println!("set OPENBUILD_PROVIDER + OPENBUILD_API_KEY then run `openbuild models live` to enumerate live model ids");
+    Ok(())
+}
+
+async fn cmd_models_live(provider: &str, base_url: &str, api_key: &str) -> Result<()> {
+    let client = reqwest::Client::builder()
+        .user_agent("openbuild/0.0.1")
+        .build()?;
+    let url = match provider {
+        "anthropic" => format!("{}/models", base_url.trim_end_matches('/')),
+        _ => format!("{}/models", base_url.trim_end_matches('/')),
+    };
+    let mut req = client.get(&url);
+    if provider == "anthropic" {
+        req = req
+            .header("x-api-key", api_key)
+            .header("anthropic-version", "2023-06-01");
+    } else {
+        req = req.bearer_auth(api_key);
+    }
+    let resp = req.send().await?;
+    let status = resp.status();
+    let body = resp.text().await?;
+    if !status.is_success() {
+        anyhow::bail!("models endpoint returned {status}: {body}");
+    }
+    let v: serde_json::Value = serde_json::from_str(&body)?;
+    let arr = v
+        .get("data")
+        .and_then(|d| d.as_array())
+        .ok_or_else(|| anyhow::anyhow!("response had no .data array"))?;
+    for item in arr {
+        if let Some(id) = item.get("id").and_then(|i| i.as_str()) {
+            println!("{id}");
+        }
+    }
     Ok(())
 }
 
@@ -1513,6 +1768,70 @@ fn cmd_skills(action: &SkillsCmd) -> Result<()> {
                 .find(|s| &s.name == name)
                 .ok_or_else(|| anyhow::anyhow!("skill not found: {name}"))?;
             println!("{}", s.body);
+        }
+        SkillsCmd::Install { source, name } => {
+            let user_dir = dirs::home_dir()
+                .context("no home")?
+                .join(".openbuild")
+                .join("skills");
+            std::fs::create_dir_all(&user_dir)?;
+            let target_name = name
+                .clone()
+                .or_else(|| {
+                    source
+                        .rsplit('/')
+                        .next()
+                        .map(|s| s.trim_end_matches(".git").to_string())
+                })
+                .ok_or_else(|| anyhow::anyhow!("can't derive skill name from source"))?;
+            let dest = user_dir.join(&target_name);
+            if source.starts_with("http")
+                && (source.ends_with(".git") || source.contains("github.com"))
+            {
+                let status = std::process::Command::new("git")
+                    .arg("clone")
+                    .arg("--depth=1")
+                    .arg(source)
+                    .arg(&dest)
+                    .status()
+                    .context("git clone")?;
+                if !status.success() {
+                    anyhow::bail!("git clone failed");
+                }
+            } else if std::path::Path::new(source).is_dir() {
+                std::fs::create_dir_all(&dest)?;
+                copy_dir(std::path::Path::new(source), &dest)?;
+            } else {
+                anyhow::bail!("unsupported skill source: {source}");
+            }
+            println!("installed -> {}", dest.display());
+        }
+        SkillsCmd::Remove { name } => {
+            let dir = dirs::home_dir()
+                .context("no home")?
+                .join(".openbuild")
+                .join("skills")
+                .join(name);
+            let existed = dir.exists();
+            if existed {
+                std::fs::remove_dir_all(&dir)?;
+            }
+            println!("removed: {existed}");
+        }
+    }
+    Ok(())
+}
+
+fn copy_dir(src: &std::path::Path, dst: &std::path::Path) -> Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        let to = dst.join(entry.file_name());
+        if ty.is_dir() {
+            copy_dir(&entry.path(), &to)?;
+        } else {
+            std::fs::copy(entry.path(), &to)?;
         }
     }
     Ok(())

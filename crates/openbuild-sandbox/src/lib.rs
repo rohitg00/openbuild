@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct Profile {
     pub name: String,
     #[serde(default)]
@@ -120,9 +120,26 @@ pub fn wrap_command(_profile: &Profile, cmd: Vec<String>) -> Result<Vec<String>>
 }
 
 pub fn discover_profile(name: &str, cwd: &Path) -> Profile {
+    if let Some(p) = load_user_profile(name) {
+        return p;
+    }
     match name {
         "off" => Profile::default(),
         "read-only" => Profile::read_only(cwd.to_path_buf()),
         _ => Profile::workspace_write(cwd.to_path_buf()),
     }
+}
+
+fn load_user_profile(name: &str) -> Option<Profile> {
+    let home = dirs::home_dir()?;
+    let path = home
+        .join(".openbuild")
+        .join("sandbox")
+        .join(format!("{name}.toml"));
+    let text = std::fs::read_to_string(&path).ok()?;
+    let mut profile: Profile = toml::from_str(&text).ok()?;
+    if profile.name.is_empty() {
+        profile.name = name.to_string();
+    }
+    Some(profile)
 }

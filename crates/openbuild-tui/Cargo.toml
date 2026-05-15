@@ -10,5 +10,8 @@ description = "Ratatui frontend (alt-screen + inline modes)"
 
 [dependencies]
 openbuild-core.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "sync"] }
 anyhow.workspace = true
+async-trait.workspace = true
+ratatui = "0.28"
+crossterm = "0.28"
