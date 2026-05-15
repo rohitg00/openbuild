@@ -87,6 +87,10 @@ impl Tool for TaskSpawn {
             reasoning_effort: effort,
             max_tokens: None,
             stream: true,
+            temperature: None,
+            top_p: None,
+            seed: None,
+            stop: Vec::new(),
         };
         let mut buf = String::new();
         let sink = Collector { buf: &mut buf };

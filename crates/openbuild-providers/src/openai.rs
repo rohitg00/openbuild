@@ -46,6 +46,14 @@ struct ChatReq<'a> {
     reasoning_effort: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream_options: Option<StreamOptions>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    top_p: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    seed: Option<u64>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    stop: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -254,6 +262,10 @@ impl Provider for OpenAi {
             stream_options: req.stream.then_some(StreamOptions {
                 include_usage: true,
             }),
+            temperature: req.temperature,
+            top_p: req.top_p,
+            seed: req.seed,
+            stop: req.stop.clone(),
         };
 
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));

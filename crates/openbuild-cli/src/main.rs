@@ -143,6 +143,24 @@ struct Cli {
     #[arg(long, default_value_t = 0)]
     auto_compact_after: u32,
 
+    #[arg(long)]
+    max_tokens: Option<u32>,
+
+    #[arg(long)]
+    temperature: Option<f32>,
+
+    #[arg(long)]
+    top_p: Option<f32>,
+
+    #[arg(long)]
+    seed: Option<u64>,
+
+    #[arg(long = "stop")]
+    stop: Vec<String>,
+
+    #[arg(long, default_value_t = false)]
+    no_context_inject: bool,
+
     #[command(subcommand)]
     cmd: Option<Cmd>,
 }
@@ -196,6 +214,8 @@ enum Cmd {
     Cost {
         #[arg(default_value = "")]
         session: String,
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
     Completions {
         shell: String,
@@ -323,6 +343,10 @@ enum ImportCmd {
     Cursor { path: std::path::PathBuf },
     Codex { path: std::path::PathBuf },
     OpenCode { path: std::path::PathBuf },
+    ClaudeAll,
+    ClaudeAgents,
+    ClaudeSkills,
+    ClaudeMcp,
 }
 
 #[derive(Subcommand, Debug)]
@@ -726,17 +750,41 @@ async fn main() -> Result<()> {
     let prompt = resolve_prompt(&cli)?;
     let api_key = cli.api_key.clone().unwrap_or_default();
 
+    let bundled_for_agent = bundled_dir();
+    let agent_def = if let Some(path) = &cli.agent_profile {
+        Some(openbuild_agents::load(
+            path,
+            openbuild_agents::Source::User,
+        )?)
+    } else if let Some(name) = &cli.agent {
+        Some(openbuild_agents::load_by_name(
+            name,
+            bundled_for_agent.as_deref(),
+        )?)
+    } else {
+        None
+    };
+
+    let mut effective_model = cli.model.clone();
+    if let Some(def) = &agent_def {
+        if cli.model == "gpt-4o-mini" {
+            if let Some(m) = &def.frontmatter.model {
+                effective_model = m.clone();
+            }
+        }
+    }
+
     let base_override = (cli.base_url != "https://api.openai.com/v1").then(|| cli.base_url.clone());
     let provider: Arc<dyn Provider> = match cli.provider.as_str() {
         "anthropic" => Arc::new(Anthropic::new(
-            cli.model.clone(),
+            effective_model.clone(),
             base_override.unwrap_or_else(|| "https://api.anthropic.com/v1".into()),
             api_key,
         )),
-        "ollama" => Arc::new(Ollama::new(cli.model.clone(), base_override)),
-        "xai" => Arc::new(XAi::new(cli.model.clone(), base_override, api_key)),
+        "ollama" => Arc::new(Ollama::new(effective_model.clone(), base_override)),
+        "xai" => Arc::new(XAi::new(effective_model.clone(), base_override, api_key)),
         _ => Arc::new(OpenAi::new(
-            cli.model.clone(),
+            effective_model.clone(),
             cli.base_url.clone(),
             api_key,
         )),
@@ -827,9 +875,21 @@ async fn main() -> Result<()> {
             "auto" => PermMode::Auto,
             "dontAsk" => PermMode::DontAsk,
             "bypassPermissions" => PermMode::BypassPermissions,
-            "plan" => PermMode::Plan,
+            "plan" if !cli.no_plan => PermMode::Plan,
+            "plan" => PermMode::Default,
             _ => PermMode::Default,
         };
+    } else if let Some(def) = &agent_def {
+        if let Some(pm) = &def.frontmatter.permission_mode {
+            engine.mode = match pm.as_str() {
+                "acceptEdits" => PermMode::AcceptEdits,
+                "auto" => PermMode::Auto,
+                "dontAsk" => PermMode::DontAsk,
+                "bypassPermissions" => PermMode::BypassPermissions,
+                "plan" if !cli.no_plan => PermMode::Plan,
+                _ => engine.mode,
+            };
+        }
     }
     for r in &cli.allow {
         engine.add_allow(r)?;
@@ -912,16 +972,8 @@ async fn main() -> Result<()> {
 
     let mut system_blocks: Vec<Block> = Vec::new();
 
-    if let Some(profile) = &cli.agent_profile {
-        let agent_def = openbuild_agents::load(profile, openbuild_agents::Source::User)
-            .with_context(|| format!("--agent-profile {}", profile.display()))?;
-        let rendered = openbuild_agents::render_prompt(&agent_def.system_prompt, &tool_names);
-        system_blocks.push(Block::Text { text: rendered });
-    } else if let Some(name) = &cli.agent {
-        let bundled = bundled_dir();
-        let agent_def = openbuild_agents::load_by_name(name, bundled.as_deref())
-            .with_context(|| format!("--agent {name}"))?;
-        let rendered = openbuild_agents::render_prompt(&agent_def.system_prompt, &tool_names);
+    if let Some(def) = &agent_def {
+        let rendered = openbuild_agents::render_prompt(&def.system_prompt, &tool_names);
         system_blocks.push(Block::Text { text: rendered });
     }
 
@@ -950,20 +1002,46 @@ async fn main() -> Result<()> {
         }
     }
 
+    if !cli.no_context_inject {
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let cwd = std::env::current_dir()
+            .ok()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
+        let user = std::env::var("USER").unwrap_or_default();
+        let os = std::env::consts::OS;
+        let ctx = format!(
+            "# Environment\nDate: {today}\nWorking directory: {cwd}\nUser: {user}\nOS: {os}\n"
+        );
+        system_blocks.push(Block::Text { text: ctx });
+    }
+
     let prompt = if cli.check && !cli.verbatim {
         format!("{prompt}\n\nAfter you finish, run a self-verification loop: list each requirement from the request, verify whether it was met, and fix any gaps before stopping.")
     } else {
         prompt
     };
 
+    let mut messages = if cli.continue_recent || cli.resume.is_some() {
+        rebuild_messages_from_session(cli.resume.as_deref(), cli.continue_recent)
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    messages.push(Message::user_text(prompt));
+
     let req = Request {
-        model: cli.model.clone(),
+        model: effective_model.clone(),
         system: system_blocks,
-        messages: vec![Message::user_text(prompt)],
+        messages,
         tools: vec![],
         reasoning_effort: effort,
-        max_tokens: None,
+        max_tokens: cli.max_tokens,
         stream: true,
+        temperature: cli.temperature,
+        top_p: cli.top_p,
+        seed: cli.seed,
+        stop: cli.stop.clone(),
     };
 
     let session = resolve_session(&cli)?;
@@ -982,7 +1060,7 @@ async fn main() -> Result<()> {
         None
     };
     let sink = Stdout {
-        format: cli.output_format,
+        format: cli.output_format.clone(),
         session,
         output_file,
         capture: String::new(),
@@ -993,12 +1071,38 @@ async fn main() -> Result<()> {
 
     let outcome = if let Some(n) = cli.best_of_n {
         run_best_of_n(agent, req, n, sink).await
+    } else if cli.check {
+        let agent_arc = Arc::new(agent);
+        let pass1 = agent_arc.run(req.clone(), sink).await;
+        if pass1.is_ok() {
+            eprintln!("[check] running verification pass");
+            let mut req2 = req;
+            req2.messages
+                .push(Message::user_text(
+                    "Verification pass: re-read your previous response. List each requirement from the original request. For each, mark done/partial/missing. Fix any gap. Output only the corrections.",
+                ));
+            let sink2 = Stdout {
+                format: cli.output_format.clone(),
+                session: None,
+                output_file: None,
+                capture: String::new(),
+                tokens_used: 0,
+                compact_threshold: cli.auto_compact_after,
+                hooks: Some(hooks.clone()),
+            };
+            let _ = agent_arc.run(req2, sink2).await;
+        }
+        pass1.map(|_| ()).map_err(Into::into)
     } else {
         agent.run(req, sink).await.map(|_| ()).map_err(Into::into)
     };
-    hooks
+    let stop_outcomes = hooks
         .fire(openbuild_hooks::Event::Stop, "", &serde_json::json!({}))
         .await;
+    let refused = stop_outcomes.iter().any(|o| o.exit_code == 2);
+    if refused {
+        eprintln!("[stop hook] refused stop (exit 2); rerun --continue to keep going");
+    }
     hooks
         .fire(
             openbuild_hooks::Event::SessionEnd,
@@ -1137,12 +1241,12 @@ async fn run_subcommand(cmd: &Cmd) -> Result<()> {
         Cmd::Update => cmd_update(),
         Cmd::Sandbox { action } => cmd_sandbox(action),
         Cmd::Tui => cmd_tui().await,
-        Cmd::Cost { session } => cmd_cost(session),
+        Cmd::Cost { session, json } => cmd_cost(session, *json),
         Cmd::Completions { shell } => cmd_completions(shell),
     }
 }
 
-fn cmd_cost(session_id: &str) -> Result<()> {
+fn cmd_cost(session_id: &str, json: bool) -> Result<()> {
     let path = if session_id.is_empty() {
         openbuild_session::most_recent()?
     } else {
@@ -1180,13 +1284,26 @@ fn cmd_cost(session_id: &str) -> Result<()> {
             .and_then(|x| x.as_u64())
             .unwrap_or(0);
     }
-    println!("session: {}", path.display());
-    println!("  input tokens:      {input}");
-    println!("  output tokens:     {output}");
-    println!("  reasoning tokens:  {reasoning}");
-    println!("  cache read:        {cache_read}");
-    println!("  cache write:       {cache_write}");
-    println!("  total:             {}", input + output + reasoning);
+    if json {
+        let out = serde_json::json!({
+            "session": path.display().to_string(),
+            "input_tokens": input,
+            "output_tokens": output,
+            "reasoning_tokens": reasoning,
+            "cache_read_tokens": cache_read,
+            "cache_write_tokens": cache_write,
+            "total_tokens": input + output + reasoning,
+        });
+        println!("{}", serde_json::to_string_pretty(&out)?);
+    } else {
+        println!("session: {}", path.display());
+        println!("  input tokens:      {input}");
+        println!("  output tokens:     {output}");
+        println!("  reasoning tokens:  {reasoning}");
+        println!("  cache read:        {cache_read}");
+        println!("  cache write:       {cache_write}");
+        println!("  total:             {}", input + output + reasoning);
+    }
     Ok(())
 }
 
@@ -1272,6 +1389,10 @@ async fn cmd_tui() -> Result<()> {
                 reasoning_effort: None,
                 max_tokens: None,
                 stream: true,
+                temperature: None,
+                top_p: None,
+                seed: None,
+                stop: Vec::new(),
             };
             struct Forward(tokio::sync::mpsc::Sender<openbuild_core::Event>);
             #[async_trait]
@@ -1518,7 +1639,125 @@ fn cmd_import(action: &ImportCmd) -> Result<()> {
         ImportCmd::Cursor { path } => import_session(path, "cursor", cursor_event_map),
         ImportCmd::Codex { path } => import_session(path, "codex", codex_event_map),
         ImportCmd::OpenCode { path } => import_session(path, "opencode", opencode_event_map),
+        ImportCmd::ClaudeAll => import_claude_all(),
+        ImportCmd::ClaudeAgents => import_claude_agents(),
+        ImportCmd::ClaudeSkills => import_claude_skills(),
+        ImportCmd::ClaudeMcp => import_claude_mcp(),
     }
+}
+
+fn import_claude_all() -> Result<()> {
+    let home = dirs::home_dir().context("no home")?;
+    let projects = home.join(".claude").join("projects");
+    if !projects.exists() {
+        anyhow::bail!("no Claude projects dir at {}", projects.display());
+    }
+    let mut count = 0;
+    for entry in walk(&projects) {
+        if entry.extension().and_then(|s| s.to_str()) == Some("jsonl")
+            && import_session(&entry, "claude", claude_event_map).is_ok()
+        {
+            count += 1;
+        }
+    }
+    println!("imported {count} session(s) from {}", projects.display());
+    Ok(())
+}
+
+fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return out;
+    };
+    for e in entries.flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            out.extend(walk(&p));
+        } else {
+            out.push(p);
+        }
+    }
+    out
+}
+
+fn import_claude_agents() -> Result<()> {
+    let home = dirs::home_dir().context("no home")?;
+    let src = home.join(".claude").join("agents");
+    let dst = home.join(".openbuild").join("agents");
+    if !src.exists() {
+        anyhow::bail!("no Claude agents dir at {}", src.display());
+    }
+    std::fs::create_dir_all(&dst)?;
+    let mut count = 0;
+    for entry in std::fs::read_dir(&src)?.flatten() {
+        let p = entry.path();
+        if p.extension().and_then(|s| s.to_str()) == Some("md") {
+            if let Some(name) = p.file_name() {
+                std::fs::copy(&p, dst.join(name))?;
+                count += 1;
+            }
+        }
+    }
+    println!("imported {count} agent(s)");
+    Ok(())
+}
+
+fn import_claude_skills() -> Result<()> {
+    let home = dirs::home_dir().context("no home")?;
+    let src = home.join(".claude").join("skills");
+    let dst = home.join(".openbuild").join("skills");
+    if !src.exists() {
+        anyhow::bail!("no Claude skills dir at {}", src.display());
+    }
+    std::fs::create_dir_all(&dst)?;
+    let mut count = 0;
+    for entry in std::fs::read_dir(&src)?.flatten() {
+        let p = entry.path();
+        if p.is_dir() {
+            if let Some(name) = p.file_name() {
+                let target = dst.join(name);
+                copy_dir(&p, &target).ok();
+                count += 1;
+            }
+        }
+    }
+    println!("imported {count} skill(s)");
+    Ok(())
+}
+
+fn import_claude_mcp() -> Result<()> {
+    let home = dirs::home_dir().context("no home")?;
+    let settings = home.join(".claude").join("settings.json");
+    if !settings.exists() {
+        anyhow::bail!("no Claude settings.json at {}", settings.display());
+    }
+    let text = std::fs::read_to_string(&settings)?;
+    let v: serde_json::Value = serde_json::from_str(&text)?;
+    let Some(servers) = v.get("mcpServers").and_then(|s| s.as_object()) else {
+        println!("no mcpServers in {}", settings.display());
+        return Ok(());
+    };
+    let mut count = 0;
+    for (name, def) in servers {
+        if let Some(cmd) = def.get("command").and_then(|c| c.as_str()) {
+            let args: Vec<String> = def
+                .get("args")
+                .and_then(|a| a.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|s| s.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+            user_config_add_mcp_stdio(name, cmd, &args)?;
+            count += 1;
+        } else if let Some(url) = def.get("url").and_then(|u| u.as_str()) {
+            user_config_add_mcp_http(name, url, "http")?;
+            count += 1;
+        }
+    }
+    println!("imported {count} MCP server(s)");
+    Ok(())
 }
 
 fn import_session(
@@ -1733,41 +1972,58 @@ async fn agent_acp() -> Result<()> {
 }
 
 async fn agent_serve(host: &str, port: u16) -> Result<()> {
-    let listener = tokio::net::TcpListener::bind((host, port)).await?;
-    eprintln!("openbuild agent serve: listening on {host}:{port}");
-    loop {
-        let (mut sock, peer) = listener.accept().await?;
-        tokio::spawn(async move {
-            use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-            let (rd, mut wr) = sock.split();
-            let mut lines = BufReader::new(rd).lines();
-            let ready = serde_json::json!({"type":"ready","peer":format!("{peer}"),"protocol":"openbuild-ipc/v0"});
-            let _ = wr.write_all(ready.to_string().as_bytes()).await;
-            let _ = wr.write_all(b"\n").await;
-            while let Ok(Some(line)) = lines.next_line().await {
-                let req: serde_json::Value = match serde_json::from_str(&line) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        let err = serde_json::json!({"type":"error","error":e.to_string()});
-                        let _ = wr.write_all(err.to_string().as_bytes()).await;
-                        let _ = wr.write_all(b"\n").await;
-                        continue;
-                    }
-                };
-                let prompt = req
-                    .get("prompt")
-                    .and_then(|p| p.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let ack = serde_json::json!({
-                    "type": "ack",
-                    "received_prompt_len": prompt.len(),
-                });
-                let _ = wr.write_all(ack.to_string().as_bytes()).await;
-                let _ = wr.write_all(b"\n").await;
-            }
-        });
+    use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
+    use axum::response::Response;
+    use axum::routing::{any, get};
+    use axum::Router;
+
+    async fn ws_handler(ws: WebSocketUpgrade) -> Response {
+        ws.on_upgrade(handle_socket)
     }
+
+    async fn handle_socket(mut socket: WebSocket) {
+        let ready = serde_json::json!({"type":"ready","protocol":"openbuild-ws/v0"});
+        let _ = socket.send(WsMessage::Text(ready.to_string().into())).await;
+        while let Some(Ok(msg)) = socket.recv().await {
+            let text = match msg {
+                WsMessage::Text(t) => t.to_string(),
+                WsMessage::Close(_) => break,
+                _ => continue,
+            };
+            let req: serde_json::Value = match serde_json::from_str(&text) {
+                Ok(v) => v,
+                Err(e) => {
+                    let err = serde_json::json!({"type":"error","error":e.to_string()});
+                    let _ = socket.send(WsMessage::Text(err.to_string().into())).await;
+                    continue;
+                }
+            };
+            let prompt = req
+                .get("prompt")
+                .and_then(|p| p.as_str())
+                .unwrap_or("")
+                .to_string();
+            let ack = serde_json::json!({
+                "type": "ack",
+                "received_prompt_len": prompt.len(),
+            });
+            let _ = socket.send(WsMessage::Text(ack.to_string().into())).await;
+        }
+    }
+
+    async fn health() -> &'static str {
+        "openbuild agent serve\n"
+    }
+
+    let app = Router::new()
+        .route("/", get(health))
+        .route("/ws", any(ws_handler));
+
+    let addr: std::net::SocketAddr = format!("{host}:{port}").parse()?;
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    eprintln!("openbuild agent serve: ws://{host}:{port}/ws");
+    axum::serve(listener, app).await?;
+    Ok(())
 }
 
 fn git_checkout(cwd: &std::path::Path, sha: &str) -> Result<()> {
@@ -1786,6 +2042,80 @@ fn git_checkout(cwd: &std::path::Path, sha: &str) -> Result<()> {
 
 fn runner_tools_snapshot(tools: &[Box<dyn Tool>]) -> Vec<String> {
     tools.iter().map(|t| t.schema().name).collect()
+}
+
+fn rebuild_messages_from_session(
+    resume_id: Option<&str>,
+    continue_recent: bool,
+) -> Result<Vec<Message>> {
+    let path = if continue_recent {
+        openbuild_session::most_recent()?
+    } else if let Some(id) = resume_id {
+        if id.is_empty() {
+            openbuild_session::most_recent()?
+        } else {
+            openbuild_session::find_by_id(id)?
+        }
+    } else {
+        None
+    };
+    let Some(path) = path else {
+        return Ok(Vec::new());
+    };
+    let text = std::fs::read_to_string(&path)?;
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let t = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        match t {
+            "user_message" => {
+                if let Some(txt) = v.get("text").and_then(|x| x.as_str()) {
+                    out.push(Message::user_text(txt));
+                } else if let Some(payload) = v.get("payload") {
+                    if let Some(s) = extract_text_from_payload(payload) {
+                        out.push(Message::user_text(s));
+                    }
+                }
+            }
+            "assistant_message" => {
+                if let Some(payload) = v.get("payload") {
+                    if let Some(s) = extract_text_from_payload(payload) {
+                        out.push(Message::assistant_text(s));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(out)
+}
+
+fn extract_text_from_payload(v: &serde_json::Value) -> Option<String> {
+    if let Some(s) = v.as_str() {
+        return Some(s.to_string());
+    }
+    if let Some(content) = v.get("content") {
+        if let Some(s) = content.as_str() {
+            return Some(s.to_string());
+        }
+        if let Some(arr) = content.as_array() {
+            let mut out = String::new();
+            for b in arr {
+                if let Some(s) = b.get("text").and_then(|t| t.as_str()) {
+                    out.push_str(s);
+                }
+            }
+            if !out.is_empty() {
+                return Some(out);
+            }
+        }
+    }
+    if let Some(text) = v.get("text").and_then(|t| t.as_str()) {
+        return Some(text.to_string());
+    }
+    None
 }
 
 fn bundled_dir() -> Option<std::path::PathBuf> {

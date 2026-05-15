@@ -52,6 +52,12 @@ struct MessagesReq<'a> {
     tools: Vec<WireTool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     thinking: Option<WireThinking>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    top_p: Option<f32>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    stop_sequences: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -278,6 +284,9 @@ impl Provider for Anthropic {
             stream: req.stream,
             tools,
             thinking,
+            temperature: req.temperature,
+            top_p: req.top_p,
+            stop_sequences: req.stop.clone(),
         };
 
         let url = format!("{}/messages", self.base_url.trim_end_matches('/'));
