@@ -747,6 +747,15 @@ async fn main() -> Result<()> {
         return run_subcommand(cmd).await;
     }
 
+    use std::io::IsTerminal as _;
+    let no_prompt_sources = cli.prompt.is_none()
+        && cli.prompt_file.is_none()
+        && cli.prompt_json.is_none()
+        && std::io::stdin().is_terminal();
+    if no_prompt_sources {
+        return cmd_tui().await;
+    }
+
     let prompt = resolve_prompt(&cli)?;
     let api_key = cli.api_key.clone().unwrap_or_default();
 
