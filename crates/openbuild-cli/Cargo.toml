@@ -1,0 +1,28 @@
+[package]
+name = "openbuild-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "openbuild — model-agnostic agent shell"
+
+[[bin]]
+name = "openbuild"
+path = "src/main.rs"
+
+[dependencies]
+openbuild-core.workspace = true
+openbuild-providers.workspace = true
+openbuild-tools.workspace = true
+openbuild-config.workspace = true
+openbuild-session.workspace = true
+tokio.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+futures.workspace = true
+tokio-stream.workspace = true
+serde_json.workspace = true
