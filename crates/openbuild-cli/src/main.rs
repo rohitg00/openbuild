@@ -134,6 +134,15 @@ struct Cli {
     #[arg(long, default_value_t = false)]
     restore_code: bool,
 
+    #[arg(long, short = 'o')]
+    output: Option<PathBuf>,
+
+    #[arg(long)]
+    plan_file: Option<PathBuf>,
+
+    #[arg(long, default_value_t = 0)]
+    auto_compact_after: u32,
+
     #[command(subcommand)]
     cmd: Option<Cmd>,
 }
@@ -184,6 +193,13 @@ enum Cmd {
     Tui,
     Setup,
     Update,
+    Cost {
+        #[arg(default_value = "")]
+        session: String,
+    },
+    Completions {
+        shell: String,
+    },
     Sandbox {
         #[command(subcommand)]
         action: SandboxCmd,
@@ -298,6 +314,7 @@ enum MemoryCmd {
     Set { key: String, value: String },
     Remove { key: String },
     Clear,
+    Edit,
 }
 
 #[derive(Subcommand, Debug)]
@@ -323,11 +340,17 @@ enum AgentRunCmd {
         #[arg(long, default_value_t = 7424)]
         port: u16,
     },
+    Acp,
 }
 
 struct Stdout {
     format: String,
     session: Option<Session>,
+    output_file: Option<std::sync::Mutex<std::fs::File>>,
+    capture: String,
+    tokens_used: u64,
+    compact_threshold: u32,
+    hooks: Option<Arc<openbuild_hooks::Registry>>,
 }
 
 #[async_trait]
@@ -336,21 +359,43 @@ impl Sink for Stdout {
         if let Some(s) = &mut self.session {
             let _ = s.append_event(&ev);
         }
+        if let Event::Usage(u) = &ev {
+            self.tokens_used += u.input_tokens as u64 + u.output_tokens as u64;
+            if self.compact_threshold > 0 && self.tokens_used >= self.compact_threshold as u64 {
+                eprintln!(
+                    "[auto-compact threshold reached at {} tokens]",
+                    self.tokens_used
+                );
+                let trigger = self.hooks.clone();
+                let tokens = self.tokens_used;
+                self.tokens_used = 0;
+                if let Some(h) = trigger {
+                    let payload = serde_json::json!({"tokens": tokens});
+                    let _ = h
+                        .fire(openbuild_hooks::Event::PreCompact, "", &payload)
+                        .await;
+                }
+                return;
+            }
+        }
         let mut out = std::io::stdout().lock();
         match ev {
-            Event::TextDelta { text } => match self.format.as_str() {
-                "json" | "streaming-json" => {
-                    let _ = writeln!(
-                        out,
-                        "{}",
-                        serde_json::json!({"type":"text_delta","text":text})
-                    );
+            Event::TextDelta { text } => {
+                self.capture.push_str(&text);
+                match self.format.as_str() {
+                    "json" | "streaming-json" => {
+                        let _ = writeln!(
+                            out,
+                            "{}",
+                            serde_json::json!({"type":"text_delta","text":text})
+                        );
+                    }
+                    _ => {
+                        let _ = write!(out, "{text}");
+                        let _ = out.flush();
+                    }
                 }
-                _ => {
-                    let _ = write!(out, "{text}");
-                    let _ = out.flush();
-                }
-            },
+            }
             Event::ThinkingDelta { text } if self.format != "plain" => {
                 let _ = writeln!(
                     out,
@@ -378,6 +423,12 @@ impl Sink for Stdout {
                         "{}",
                         serde_json::json!({"type":"done","reason":reason})
                     );
+                }
+                if let Some(f) = &self.output_file {
+                    if let Ok(mut f) = f.lock() {
+                        let _ = std::io::Write::write_all(&mut *f, self.capture.as_bytes());
+                        self.capture.clear();
+                    }
                 }
             }
             _ => {}
@@ -920,9 +971,24 @@ async fn main() -> Result<()> {
         eprintln!("session: {}", s.path().display());
     }
 
+    let output_file = if let Some(path) = &cli.output {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        Some(std::sync::Mutex::new(
+            std::fs::File::create(path).with_context(|| format!("create {}", path.display()))?,
+        ))
+    } else {
+        None
+    };
     let sink = Stdout {
         format: cli.output_format,
         session,
+        output_file,
+        capture: String::new(),
+        tokens_used: 0,
+        compact_threshold: cli.auto_compact_after,
+        hooks: Some(hooks.clone()),
     };
 
     let outcome = if let Some(n) = cli.best_of_n {
@@ -958,7 +1024,17 @@ fn resolve_prompt(cli: &Cli) -> Result<String> {
         }
         return Ok(v.to_string());
     }
-    anyhow::bail!("no prompt; use -p, --prompt-file, or --prompt-json")
+    use std::io::IsTerminal;
+    if !std::io::stdin().is_terminal() {
+        use std::io::Read;
+        let mut buf = String::new();
+        std::io::stdin().read_to_string(&mut buf)?;
+        let trimmed = buf.trim();
+        if !trimmed.is_empty() {
+            return Ok(trimmed.to_string());
+        }
+    }
+    anyhow::bail!("no prompt; use -p, --prompt-file, --prompt-json, or pipe via stdin")
 }
 
 fn resolve_session(cli: &Cli) -> Result<Option<Session>> {
@@ -1060,29 +1136,184 @@ async fn run_subcommand(cmd: &Cmd) -> Result<()> {
         Cmd::Setup => cmd_setup(),
         Cmd::Update => cmd_update(),
         Cmd::Sandbox { action } => cmd_sandbox(action),
-        Cmd::Tui => cmd_tui(),
+        Cmd::Tui => cmd_tui().await,
+        Cmd::Cost { session } => cmd_cost(session),
+        Cmd::Completions { shell } => cmd_completions(shell),
     }
 }
 
-fn cmd_tui() -> Result<()> {
-    struct EchoHandler;
-    impl openbuild_tui::LineHandler for EchoHandler {
-        fn handle(&mut self, line: &str) -> Vec<String> {
-            match line {
-                "/help" => vec![
-                    "/quit  exit".into(),
-                    "/help  show this".into(),
-                    "(real chat: use `openbuild -p \"...\"` until v0.2 TUI streaming lands)".into(),
-                ],
-                _ => vec![format!("(stub) noted: {line}")],
+fn cmd_cost(session_id: &str) -> Result<()> {
+    let path = if session_id.is_empty() {
+        openbuild_session::most_recent()?
+    } else {
+        openbuild_session::find_by_id(session_id)?
+    };
+    let Some(path) = path else {
+        anyhow::bail!("no session found");
+    };
+    let text = std::fs::read_to_string(&path)?;
+    let mut input = 0u64;
+    let mut output = 0u64;
+    let mut reasoning = 0u64;
+    let mut cache_read = 0u64;
+    let mut cache_write = 0u64;
+    for line in text.lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let t = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        if t != "usage" {
+            continue;
+        }
+        input += v.get("input_tokens").and_then(|x| x.as_u64()).unwrap_or(0);
+        output += v.get("output_tokens").and_then(|x| x.as_u64()).unwrap_or(0);
+        reasoning += v
+            .get("reasoning_tokens")
+            .and_then(|x| x.as_u64())
+            .unwrap_or(0);
+        cache_read += v
+            .get("cache_read_tokens")
+            .and_then(|x| x.as_u64())
+            .unwrap_or(0);
+        cache_write += v
+            .get("cache_write_tokens")
+            .and_then(|x| x.as_u64())
+            .unwrap_or(0);
+    }
+    println!("session: {}", path.display());
+    println!("  input tokens:      {input}");
+    println!("  output tokens:     {output}");
+    println!("  reasoning tokens:  {reasoning}");
+    println!("  cache read:        {cache_read}");
+    println!("  cache write:       {cache_write}");
+    println!("  total:             {}", input + output + reasoning);
+    Ok(())
+}
+
+fn cmd_completions(shell: &str) -> Result<()> {
+    use clap::CommandFactory;
+    use clap_complete::{generate, Shell};
+    let s = match shell {
+        "bash" => Shell::Bash,
+        "zsh" => Shell::Zsh,
+        "fish" => Shell::Fish,
+        "powershell" => Shell::PowerShell,
+        "elvish" => Shell::Elvish,
+        _ => anyhow::bail!("unsupported shell: {shell}"),
+    };
+    let mut cmd = Cli::command();
+    let bin_name = cmd.get_name().to_string();
+    generate(s, &mut cmd, bin_name, &mut std::io::stdout());
+    Ok(())
+}
+
+async fn cmd_tui() -> Result<()> {
+    let api_key = std::env::var("OPENBUILD_API_KEY").ok().unwrap_or_default();
+    let base_url =
+        std::env::var("OPENBUILD_BASE_URL").unwrap_or_else(|_| "https://api.openai.com/v1".into());
+    let provider_name = std::env::var("OPENBUILD_PROVIDER").unwrap_or_else(|_| "openai".into());
+    let model = std::env::var("OPENBUILD_MODEL").unwrap_or_else(|_| "gpt-4o-mini".into());
+
+    let provider: Arc<dyn Provider> = match provider_name.as_str() {
+        "anthropic" => Arc::new(Anthropic::new(
+            model.clone(),
+            if base_url == "https://api.openai.com/v1" {
+                "https://api.anthropic.com/v1".into()
+            } else {
+                base_url.clone()
+            },
+            api_key,
+        )),
+        "ollama" => Arc::new(Ollama::new(model.clone(), Some(base_url))),
+        "xai" => Arc::new(XAi::new(model.clone(), Some(base_url), api_key)),
+        _ => Arc::new(OpenAi::new(model.clone(), base_url, api_key)),
+    };
+
+    let tools = openbuild_tools::default_tools_with(openbuild_tools::BuildOpts {
+        sandbox_profile: None,
+        web_disabled: false,
+    });
+    let engine = openbuild_permissions::Engine {
+        mode: openbuild_permissions::Mode::BypassPermissions,
+        ..Default::default()
+    };
+    let hooks = Arc::new(openbuild_hooks::Registry::default());
+    let runner = Arc::new(GatedTools {
+        tools,
+        engine,
+        secret_filter: openbuild_redact::Filter::new(),
+        hooks,
+    });
+    let agent = Arc::new(AgentLoop {
+        provider,
+        tools: runner,
+        max_turns: 10,
+    });
+
+    struct ChatBackend {
+        agent: Arc<AgentLoop>,
+        model: String,
+        history: Vec<Message>,
+    }
+
+    #[async_trait]
+    impl openbuild_tui::Backend for ChatBackend {
+        async fn send(
+            &mut self,
+            prompt: String,
+            out: tokio::sync::mpsc::Sender<openbuild_core::Event>,
+        ) {
+            self.history.push(Message::user_text(prompt));
+            let req = Request {
+                model: self.model.clone(),
+                system: vec![],
+                messages: self.history.clone(),
+                tools: vec![],
+                reasoning_effort: None,
+                max_tokens: None,
+                stream: true,
+            };
+            struct Forward(tokio::sync::mpsc::Sender<openbuild_core::Event>);
+            #[async_trait]
+            impl openbuild_core::Sink for Forward {
+                async fn on(&mut self, ev: openbuild_core::Event) {
+                    let _ = self.0.send(ev).await;
+                }
+            }
+            let sink = Forward(out);
+            let _ = self.agent.run(req, sink).await;
+        }
+
+        fn slash(&mut self, cmd: &str, arg: &str) -> Option<String> {
+            match cmd {
+                "/help" => Some("/quit /clear /cost /agent NAME /model NAME /help".into()),
+                "/cost" => Some("(cost tracker — pending TUI integration)".into()),
+                "/model" => {
+                    if arg.is_empty() {
+                        Some(format!("current model: {}", self.model))
+                    } else {
+                        self.model = arg.to_string();
+                        Some(format!("model set to {}", self.model))
+                    }
+                }
+                "/agent" => Some(format!(
+                    "(agent switch not wired in TUI yet; restart with --agent {arg})"
+                )),
+                _ => None,
             }
         }
+
         fn header(&self) -> String {
-            "openbuild tui (preview)".into()
+            format!("openbuild — {}", self.model)
         }
     }
-    let mut h = EchoHandler;
-    openbuild_tui::run(&mut h, true)
+
+    let mut backend = ChatBackend {
+        agent,
+        model,
+        history: Vec::new(),
+    };
+    openbuild_tui::run_streaming(&mut backend, true).await
 }
 
 fn cmd_sandbox(action: &SandboxCmd) -> Result<()> {
@@ -1264,6 +1495,19 @@ fn cmd_memory(action: &MemoryCmd) -> Result<()> {
             openbuild_memory::save(&openbuild_memory::Store::default())?;
             println!("cleared");
         }
+        MemoryCmd::Edit => {
+            let path = openbuild_memory::path()?;
+            if !path.exists() {
+                openbuild_memory::save(&openbuild_memory::Store::default())?;
+            }
+            let editor = std::env::var("EDITOR")
+                .or_else(|_| std::env::var("VISUAL"))
+                .unwrap_or_else(|_| "vi".into());
+            let status = std::process::Command::new(&editor).arg(&path).status()?;
+            if !status.success() {
+                anyhow::bail!("editor exited non-zero");
+            }
+        }
     }
     Ok(())
 }
@@ -1424,7 +1668,68 @@ async fn cmd_agent_ipc(action: &AgentRunCmd) -> Result<()> {
             Ok(())
         }
         AgentRunCmd::Serve { host, port } => agent_serve(host, *port).await,
+        AgentRunCmd::Acp => agent_acp().await,
     }
+}
+
+async fn agent_acp() -> Result<()> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let mut stdin = BufReader::new(tokio::io::stdin()).lines();
+    let mut stdout = tokio::io::stdout();
+    let ready = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "0.1.0",
+            "serverInfo": {"name": "openbuild", "version": env!("CARGO_PKG_VERSION")},
+            "capabilities": {
+                "prompts": {},
+                "tools": {},
+                "resources": {}
+            }
+        }
+    });
+    stdout.write_all(ready.to_string().as_bytes()).await?;
+    stdout.write_all(b"\n").await?;
+    while let Ok(Some(line)) = stdin.next_line().await {
+        let req: serde_json::Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(e) => {
+                let err = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "error": {"code": -32700, "message": e.to_string()},
+                });
+                stdout.write_all(err.to_string().as_bytes()).await?;
+                stdout.write_all(b"\n").await?;
+                continue;
+            }
+        };
+        let id = req.get("id").cloned();
+        let method = req
+            .get("method")
+            .and_then(|m| m.as_str())
+            .unwrap_or("")
+            .to_string();
+        let result = match method.as_str() {
+            "initialize" => serde_json::json!({"protocolVersion":"0.1.0"}),
+            "prompts/list" => serde_json::json!({"prompts": []}),
+            "tools/list" => {
+                let tools = openbuild_tools::default_tools();
+                let schemas: Vec<_> = tools.iter().map(|t| t.schema()).collect();
+                serde_json::json!({"tools": schemas})
+            }
+            "shutdown" => serde_json::json!({}),
+            _ => serde_json::json!({"unsupported_method": method}),
+        };
+        let resp = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": result,
+        });
+        stdout.write_all(resp.to_string().as_bytes()).await?;
+        stdout.write_all(b"\n").await?;
+    }
+    Ok(())
 }
 
 async fn agent_serve(host: &str, port: u16) -> Result<()> {
