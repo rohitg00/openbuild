@@ -10,8 +10,9 @@ description = "MCP client (stdio + http + sse)"
 
 [dependencies]
 openbuild-core.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["process", "macros", "rt", "io-util", "sync"] }
 serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
+tracing.workspace = true

@@ -1,11 +1,12 @@
 use anyhow::Result;
 use async_trait::async_trait;
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use openbuild_core::{
-    AgentLoop, Event, Message, Provider, Request, Sink, ToolCall, ToolResult, ToolRunner,
+    AgentLoop, Effort, Event, Message, Provider, Request, Sink, ToolCall, ToolResult, ToolRunner,
     ToolSchema,
 };
-use openbuild_providers::{anthropic::Anthropic, openai::OpenAi};
+use openbuild_providers::{anthropic::Anthropic, ollama::Ollama, openai::OpenAi, xai::XAi};
+use openbuild_session::Session;
 use openbuild_tools::{read_file::ReadFile, run_terminal_cmd::RunTerminalCmd, Tool};
 use std::io::Write;
 use std::sync::Arc;
@@ -40,15 +41,34 @@ struct Cli {
 
     #[arg(long, default_value_t = false)]
     no_tools: bool,
+
+    #[arg(long, value_parser = ["low", "medium", "high", "xhigh", "max"])]
+    reasoning_effort: Option<String>,
+
+    #[arg(long, default_value_t = false)]
+    no_session_log: bool,
+
+    #[command(subcommand)]
+    cmd: Option<Cmd>,
+}
+
+#[derive(Subcommand, Debug)]
+enum Cmd {
+    Inspect,
+    Models,
 }
 
 struct Stdout {
     format: String,
+    session: Option<Session>,
 }
 
 #[async_trait]
 impl Sink for Stdout {
     async fn on(&mut self, ev: Event) {
+        if let Some(s) = &mut self.session {
+            let _ = s.append_event(&ev);
+        }
         let mut out = std::io::stdout().lock();
         match ev {
             Event::TextDelta { text } => match self.format.as_str() {
@@ -141,22 +161,26 @@ async fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
+
+    if let Some(cmd) = &cli.cmd {
+        return run_subcommand(cmd).await;
+    }
+
     let prompt = cli
         .prompt
         .clone()
         .ok_or_else(|| anyhow::anyhow!("interactive mode pending; pass -p \"...\""))?;
     let api_key = cli.api_key.clone().unwrap_or_default();
 
+    let base_override = (cli.base_url != "https://api.openai.com/v1").then(|| cli.base_url.clone());
     let provider: Arc<dyn Provider> = match cli.provider.as_str() {
         "anthropic" => Arc::new(Anthropic::new(
             cli.model.clone(),
-            if cli.base_url == "https://api.openai.com/v1" {
-                "https://api.anthropic.com/v1".into()
-            } else {
-                cli.base_url.clone()
-            },
+            base_override.unwrap_or_else(|| "https://api.anthropic.com/v1".into()),
             api_key,
         )),
+        "ollama" => Arc::new(Ollama::new(cli.model.clone(), base_override)),
+        "xai" => Arc::new(XAi::new(cli.model.clone(), base_override, api_key)),
         _ => Arc::new(OpenAi::new(
             cli.model.clone(),
             cli.base_url.clone(),
@@ -180,20 +204,77 @@ async fn main() -> Result<()> {
         max_turns: cli.max_turns,
     };
 
+    let effort = cli.reasoning_effort.as_deref().map(|s| match s {
+        "low" => Effort::Low,
+        "medium" => Effort::Medium,
+        "high" => Effort::High,
+        "xhigh" => Effort::Xhigh,
+        _ => Effort::Max,
+    });
+
     let req = Request {
         model: cli.model,
         system: vec![],
         messages: vec![Message::user_text(prompt)],
         tools: vec![],
-        reasoning_effort: None,
+        reasoning_effort: effort,
         max_tokens: None,
         stream: true,
     };
 
+    let session = (!cli.no_session_log).then(Session::create).transpose()?;
+    if let Some(s) = &session {
+        eprintln!("session: {}", s.path().display());
+    }
+
     let sink = Stdout {
         format: cli.output_format,
+        session,
     };
 
     agent.run(req, sink).await?;
+    Ok(())
+}
+
+async fn run_subcommand(cmd: &Cmd) -> Result<()> {
+    match cmd {
+        Cmd::Inspect => {
+            let cwd = std::env::current_dir()?;
+            let cfg = openbuild_config::import::discover_all(&cwd);
+            println!("openbuild inspect");
+            println!("  cwd: {}", cwd.display());
+            println!("  instructions ({}):", cfg.instructions.len());
+            for i in &cfg.instructions {
+                println!(
+                    "    [{:?}] {} ({} bytes)",
+                    i.scope,
+                    i.path.display(),
+                    i.bytes
+                );
+            }
+            println!("  permissions:");
+            println!("    allow: {}", cfg.permissions.allow.len());
+            println!("    deny:  {}", cfg.permissions.deny.len());
+            if let Some(m) = &cfg.permissions.default_mode {
+                println!("    mode:  {m}");
+            }
+            println!("  mcp_servers ({}):", cfg.mcp_servers.len());
+            for name in cfg.mcp_servers.keys() {
+                println!("    {name}");
+            }
+            println!("  imported from:");
+            for s in &cfg.provenance {
+                println!("    [{:?}] {}", s.agent, s.path.display());
+            }
+        }
+        Cmd::Models => {
+            println!("openbuild provider matrix");
+            println!("  openai     https://api.openai.com/v1");
+            println!("  anthropic  https://api.anthropic.com/v1");
+            println!("  xai        https://api.x.ai/v1");
+            println!("  ollama     http://localhost:11434/v1");
+            println!("  + any OpenAI-compatible endpoint via --base-url");
+        }
+    }
     Ok(())
 }

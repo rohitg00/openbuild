@@ -4,5 +4,7 @@ pub mod anthropic;
 pub mod ollama;
 #[cfg(feature = "openai")]
 pub mod openai;
+#[cfg(feature = "openai")]
+pub mod xai;
 
 mod sse;

@@ -9,11 +9,12 @@ rust-version.workspace = true
 description = "Provider adapters: OpenAI-compatible, Anthropic, Ollama, xAI, OpenRouter, Bedrock, Vertex"
 
 [features]
-default = ["openai", "anthropic", "ollama"]
+default = ["openai", "anthropic", "ollama", "xai"]
 openai = []
 anthropic = []
 ollama = []
-openrouter = []
+xai = ["openai"]
+openrouter = ["openai"]
 bedrock = []
 vertex = []
 
